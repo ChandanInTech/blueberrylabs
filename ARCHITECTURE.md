@@ -433,21 +433,25 @@ Authentication is intentionally lightweight for the assessment, but it is
 JWT sent as a bearer token. This section is the authoritative description of
 what is implemented.
 
-### 5.1 The flow
+### 5.1 The model: a code is a user's permanent login
+
+**One code per user. It never changes. The user enters it to log in, every
+time.** There is no signup, no password, and no code rotation.
 
 ```
 operator                    backend                     browser
    |                           |                            |
    | bun run auth:code         |                            |
-   |-------------------------->|  INSERT access_codes       |
-   |<--------------------------|  (hash only)               |
+   |-------------------------->|  INSERT users              |
+   |                           |  INSERT access_codes       |
+   |<--------------------------|  (hash only, no expiry)    |
    |      "9GGCN-SKFAC"        |                            |
    |                           |                            |
-   |  (out of band: email/Slack/read it aloud)              |
+   |  (out of band: email/Slack/read it aloud - ONCE)       |
    |                           |                            |
    |                           |<--- POST /auth/login {code}
-   |                           |  verify hash, expiry,      |
-   |                           |  single-use claim          |
+   |                           |  hash match                |
+   |                           |  not revoked               |
    |                           |  INSERT auth_sessions      |
    |                           |--- { token, expiresAt } --->
    |                           |                            | localStorage
@@ -455,24 +459,31 @@ operator                    backend                     browser
    |                           |  verify signature + exp    |
    |                           |  check auth_sessions row   |
    |                           |--- 200 ------------------->|
+   |                           |                            |
+   |                           |<--- POST /auth/login {code}   (next day)
+   |                           |  same code, same user      |
+   |                           |--- new token ------------->|
 ```
 
 1. **The operator issues a code.** `bun run auth:code -- --label "alice"`
-   creates a demo user (or reuses one via `--user <uuid>`) and an
-   `access_codes` row. The raw code is printed **once** and never stored —
-   only its SHA-256 hash is persisted.
+   creates a user and its one `access_codes` row. The raw code is printed
+   **once** and never stored — only its SHA-256 hash is persisted, so it
+   cannot be recovered or re-displayed.
 2. **The user enters the code** on `/login`. The frontend posts it to
    `POST /api/v1/auth/login`.
-3. **The backend verifies the code** (hash match, not expired, not revoked,
-   not already redeemed) and, in the same transaction, claims it as redeemed
-   and inserts an `auth_sessions` row whose `id` becomes the token's `jti`.
-4. **The backend returns a JWT** plus its expiry. The frontend stores it in
-   `localStorage`.
+3. **The backend verifies the code** (hash match, not revoked) and inserts an
+   `auth_sessions` row whose `id` becomes the token's `jti`. The code is
+   **not** consumed — it stays valid forever.
+4. **The backend returns a JWT** valid for `JWT_TTL_HOURS` (24h). The frontend
+   stores it in `localStorage`.
 5. **Every subsequent request** carries `Authorization: Bearer <token>`. The
    backend verifies the signature and `exp`, then confirms the `auth_sessions`
    row still exists and is not revoked.
-6. **Logout** sets `revoked_at` on that row, so the token stops working
-   immediately rather than at expiry.
+6. **When the token expires**, the user enters the *same* code again and gets a
+   fresh token. The identity is unchanged; only the session is new.
+7. **Logout** sets `revoked_at` on that session row, so that token stops
+   working immediately rather than at expiry. The code is unaffected — the
+   user can log straight back in.
 
 ### 5.2 Why a bearer token instead of a cookie
 
@@ -554,28 +565,55 @@ rehydrate without a second login round trip.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `JWT_SECRET` | *(required, min 32 chars)* | HS256 signing key. Rotating it invalidates every issued token — the "sign everyone out" lever. |
-| `JWT_TTL_HOURS` | `24` | Token lifetime. The user re-enters a code after this. |
-| `ACCESS_CODE_SINGLE_USE` | `true` | Whether a code can be redeemed more than once. |
-| `ACCESS_CODE_TTL_HOURS` | `720` (30 days) | How long an unused code stays redeemable. |
+| `JWT_TTL_HOURS` | `24` | Token lifetime. The user re-enters the same code after this. |
+| `ACCESS_CODE_SINGLE_USE` | `false` | Escape hatch for one-off invitation codes. **Leave off**: codes are permanent logins. |
 
 Generate a secret with `openssl rand -base64 48`.
 
-### 5.7 Issuing codes
+There is deliberately no `ACCESS_CODE_TTL_HOURS`. A code that expires would
+lock its user out permanently, since the raw value cannot be re-issued from
+its hash.
+
+### 5.7 Managing codes
 
 ``` bash
-# Local
+# New user + its permanent code
 cd backend && bun run auth:code -- --label "alice"
 
-# Against the deployed database
-railway run --service blueberrylabs-backend bun run auth:code -- --label "alice"
+# Who has a code, and who is missing one
+bun run auth:code -- --list
 
-# Another code for an existing user (e.g. a second device)
-bun run auth:code -- --user <uuid> --label "second device"
+# Issue a code for every user that lacks one (safe to re-run)
+bun run auth:code -- --backfill
+
+# Code for an existing user (reports "already has one" if so)
+bun run auth:code -- --user <uuid>
+```
+
+Against the deployed database, run inside the container — `railway run`
+executes locally, where `postgres.railway.internal` does not resolve:
+
+``` bash
+railway ssh --service blueberrylabs-backend "bun run auth:code -- --list"
 ```
 
 The code is 10 alphanumerics, displayed grouped as `ABCDE-FGHIJ`. Input is
 normalised (separators stripped, case folded) before hashing, so
 `abcde-fghij`, `ABCDE FGHIJ`, and `ABCDEFGHIJ` all resolve to the same row.
+
+**One code per user is enforced by a unique index on `access_codes.user_id`**,
+not by convention. Attempting to insert a second code for a user fails at the
+database level.
+
+**Replacing a code.** Because only the hash is stored, a code cannot be
+re-displayed. To rotate one, revoke the old row and issue a new one:
+
+``` sql
+UPDATE access_codes SET revoked_at = now() WHERE user_id = '<uuid>';
+```
+
+Then run `bun run auth:code -- --user <uuid>` again. The user's data is
+untouched — ownership is by `user_id`, not by code.
 
 ### 5.8 Demo limitations
 
@@ -583,9 +621,11 @@ This is not production-grade account authentication. Documented plainly:
 
 -   There is no signup, password, OAuth, or email verification. Codes are
     issued by an operator out of band.
--   There is no per-user profile, password reset, or account recovery.
--   A code is a bearer credential: anyone who has it can sign in until it is
-    redeemed (if single-use) or expires.
+-   **A code is a long-lived bearer credential.** Anyone who learns it can log
+    in as that user indefinitely. Treat it like a password: send it over a
+    private channel, and revoke it if it leaks.
+-   There is no per-user profile, password reset, or account recovery. Losing
+    the code means the operator must revoke and re-issue.
 -   Demo mode must not be presented as secure multi-tenant identity.
 -   Before public production use, replace this with a proper identity provider
     and retain the same `userId` ownership model — every route already derives
@@ -849,25 +889,26 @@ Demo identity table.
 
 ### 8.2 `access_codes`
 
-The only way to obtain a token (section 5).
+The permanent login credential for a user (section 5).
 
   Column         Type                   Notes
   -------------- ---------------------- ------------------------------------------------
   `id`           uuid PK                Code ID
   `code_hash`    text unique            SHA-256 of the normalised code; raw code never stored
-  `user_id`      uuid FK                References users (cascade delete)
+  `user_id`      uuid FK **unique**     References users (cascade delete). One code per user.
   `label`        text nullable          Operator note, e.g. who the code was issued to
-  `expires_at`   timestamptz            After this the code is refused
-  `redeemed_at`  timestamptz nullable   Set on first successful login (single-use)
-  `revoked_at`   timestamptz nullable   Manual revocation
+  `expires_at`   timestamptz nullable   `NULL` for a permanent code (the normal case)
+  `redeemed_at`  timestamptz nullable   Only set when `ACCESS_CODE_SINGLE_USE=true`
+  `revoked_at`   timestamptz nullable   Manual revocation; the only way to disable a code
   `created_at`   timestamptz            Default now
 
-Indexes: unique on `code_hash` (the login lookup), plus `user_id` and
-`expires_at` for the retention sweep.
+Indexes: unique on `code_hash` (the login lookup), **unique on `user_id`**
+(enforces one code per user at the database level), and `expires_at` for the
+retention sweep.
 
-Single-use is enforced by `UPDATE ... WHERE redeemed_at IS NULL RETURNING id`
-inside the login transaction, so two concurrent redemptions of one code yield
-exactly one token (covered by an integration test).
+Because a code is a permanent credential, `cleanup_expired_rows()` deletes only
+rows with `revoked_at` set, and only after a week. Deleting a live code would
+lock its user out forever.
 
 ### 8.3 `auth_sessions`
 
@@ -1306,6 +1347,9 @@ upload.
   GET      `/auth/session`   bearer Return the current principal
   POST     `/auth/logout`    bearer Revoke the current token (204)
 
+`POST /auth/login` exchanges a user's permanent code for a token. The same code
+can be used any number of times; each call creates a new session.
+
 `POST /auth/login` request and response:
 
 ``` json
@@ -1618,8 +1662,8 @@ API_PUBLIC_URL=http://localhost:3001
 # openssl rand -base64 48
 JWT_SECRET=replace-with-at-least-32-random-chars
 JWT_TTL_HOURS=24
-ACCESS_CODE_SINGLE_USE=true
-ACCESS_CODE_TTL_HOURS=720
+# Leave false: access codes are permanent logins, not one-off invitations.
+ACCESS_CODE_SINGLE_USE=false
 
 RAILWAY_BUCKET_ENDPOINT=
 RAILWAY_BUCKET_REGION=
@@ -2496,6 +2540,8 @@ Files that make up the auth flow, in the order a request touches them:
 | `backend/src/db/schema/index.ts` | `access_codes`, `auth_sessions`. |
 | `backend/src/db/migrations/0002_jwt_auth.sql` | Creates both tables and their indexes. |
 | `backend/src/db/migrations/0003_cleanup_jwt_auth.sql` | Extends `cleanup_expired_rows()` to prune both. |
+| `backend/src/db/migrations/0004_permanent_access_codes.sql` | Makes codes permanent: `expires_at` nullable, collapses duplicate codes per user, adds the unique `user_id` index, clears `redeemed_at`. |
+| `backend/src/db/migrations/0005_cleanup_permanent_codes.sql` | Stops the sweep from deleting live codes — only revoked ones, after a week. |
 | `frontend/lib/api-client.ts` | `getToken`/`setToken`/`readAuthToken`; attaches `Authorization` on every request. |
 | `frontend/lib/auth.ts` | `loadSession`, `login`, `endSession`. |
 | `frontend/components/session/session-provider.tsx` | `signIn(code)`, `signOut()`. |
@@ -2506,17 +2552,28 @@ Test coverage added for this flow:
 | Suite | What it pins |
 | --- | --- |
 | `backend/test/unit/jwt.test.ts` | Round-trip, TTL, HS256 header, wrong secret, tampered payload, expired, `alg:none` downgrade, malformed input, missing claims. |
-| `backend/test/integration/auth.test.ts` | Code → token, 24h TTL, separator/case normalisation, unknown/expired/revoked code, single-use, **8 concurrent redemptions yield exactly 1 token**, raw code never stored, schema validation, Bearer accepted, missing/malformed/forged/tampered/wrong-secret/expired token rejected, deleted session row rejected, logout revokes immediately, logout does not affect sibling sessions, origin allow-list. |
+| `backend/test/integration/auth.test.ts` | Code → token, 24h TTL, separator/case normalisation, unknown/expired/revoked code, **the same code logs the same user in repeatedly with a distinct token each time**, **8 concurrent logins with one code all succeed**, **a user can only have one code** (unique index), `getOrCreateAccessCode` idempotency, **backfill issues a code for every user lacking one and the code works**, raw code never stored, schema validation, Bearer accepted, missing/malformed/forged/tampered/wrong-secret/expired token rejected, deleted session row rejected, logout revokes immediately, logout does not affect sibling sessions, origin allow-list. |
 | `frontend/test/token-storage.test.ts` | Read/write/clear, SSR returns `null`, storage that throws does not crash. |
 
-Live end-to-end verification (14 checks, all passing) exercised the real HTTP
-server against a real PostgreSQL database: login, 24h TTL, Bearer accepted,
-no-token 401, tampered-signature 401, garbage-token 401 on a protected route,
-valid token 200 on a protected route, code reuse 401, logout 204, token dead
-after logout, raw code absent from the database, and CORS advertising
-`Authorization`.
+Live end-to-end verification exercised the real HTTP server against a real
+PostgreSQL database: login, 24h TTL, Bearer accepted, no-token 401,
+tampered-signature 401, garbage-token 401 on a protected route, valid token 200
+on a protected route, logout 204, token dead after logout, raw code absent from
+the database, and CORS advertising `Authorization`.
+
+The permanent-code migration was additionally verified against a database
+seeded with the *pre-migration* shape — one user holding two codes, one of them
+already redeemed — confirming that `0004` collapses the duplicates to one,
+clears `expires_at` and `redeemed_at`, and that the unique index then rejects a
+second code for the same user.
 
 **Deliberate non-goals** (documented rather than hidden): no refresh token, no
 token rotation, no per-device session listing, no rate limit on `/auth/session`
 beyond the general limiter. A 24-hour token with immediate revocation was the
 requested behaviour.
+
+**Known tradeoff of permanent codes:** a code is a long-lived bearer
+credential. Anyone who learns it can log in as that user until the operator
+revokes it. This is the explicit product decision — "the user can enter this
+code and they login" — and it is why codes are hashed at rest, never logged,
+and shown only once.
