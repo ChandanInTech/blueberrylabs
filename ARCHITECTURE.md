@@ -1986,6 +1986,14 @@ Deployment:
 > boundaries, or operational behaviour change, update it here rather than
 > letting this document drift from the code.
 
+**TypeScript version note:** `backend/tsconfig.json` deliberately has no
+`baseUrl`. TypeScript 6.0 (and the 6.0 nightly shipped with the VS Code
+TypeScript extension) reports `TS5101` against it, and it stops functioning in
+7.0. `paths` resolves relative to the tsconfig since TS 4.4, so the `./`-prefixed
+mappings are correct without it. Do not reintroduce `baseUrl`, and do not paper
+over the diagnostic with `ignoreDeprecations`. Verified against TypeScript
+5.9.3, 6.0.0-dev and the TS 7 native preview.
+
 **Last verified:** 2026-11-05 — `lint`, `typecheck`, and 92 tests pass
 (82 backend, 10 frontend) from a cold start with automatic PostgreSQL
 provisioning; the full browser flow was exercised against a running stack.
