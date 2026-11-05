@@ -352,7 +352,7 @@ frontend/
 │   │   ├── generations/[id]/page.tsx
 │   │   └── history/page.tsx
 │   ├── api/                 # Only if a Next.js proxy is genuinely needed
-│   ├── login/page.tsx       # Demo entry point
+│   ├── login/page.tsx       # Access-code entry point
 │   ├── layout.tsx
 │   └── globals.css
 ├── components/
@@ -364,8 +364,8 @@ frontend/
 │   ├── use-upload.ts
 │   └── use-generation-polling.ts
 ├── lib/
-│   ├── api-client.ts
-│   ├── auth.ts
+│   ├── api-client.ts        # token storage + Authorization header
+│   ├── auth.ts              # loadSession / login / endSession
 │   └── validation.ts
 ├── package.json
 └── README.md
@@ -426,47 +426,187 @@ TypeScript contracts must be distributed explicitly:
 
 ------------------------------------------------------------------------
 
-## 5. Authentication: demo-only
+## 5. Authentication: access code → JWT
 
-Authentication is intentionally lightweight for the assessment. It must
-still establish a server-controlled user identity; never trust a
-`userId` supplied in a request body or header.
+Authentication is intentionally lightweight for the assessment, but it is
+**not** cookie-based and **not** CSRF-protected. The credential is a signed
+JWT sent as a bearer token. This section is the authoritative description of
+what is implemented.
 
-### 5.1 Required behavior
+### 5.1 The flow
 
--   Provide a clearly labelled **Continue with demo account** action.
--   Backend creates or reuses a demo principal and issues a
-    server-generated session.
--   Store session state in PostgreSQL, or use a cryptographically signed
-    short-lived token with server-side validation/revocation as
-    appropriate.
--   Prefer an `HttpOnly`, `Secure` (in production), `SameSite=Lax` or
-    stricter cookie.
--   Use CSRF protection for cookie-authenticated state-changing
-    requests. Validate `Origin` and use a CSRF token or equivalent
-    protection.
--   Session expiry should be configurable; use a short demo session
-    lifetime.
--   All API routes that access user-owned data require the demo session.
--   The server derives `userId` from the validated session.
+```
+operator                    backend                     browser
+   |                           |                            |
+   | bun run auth:code         |                            |
+   |-------------------------->|  INSERT access_codes       |
+   |<--------------------------|  (hash only)               |
+   |      "9GGCN-SKFAC"        |                            |
+   |                           |                            |
+   |  (out of band: email/Slack/read it aloud)              |
+   |                           |                            |
+   |                           |<--- POST /auth/login {code}
+   |                           |  verify hash, expiry,      |
+   |                           |  single-use claim          |
+   |                           |  INSERT auth_sessions      |
+   |                           |--- { token, expiresAt } --->
+   |                           |                            | localStorage
+   |                           |<--- Authorization: Bearer <token>
+   |                           |  verify signature + exp    |
+   |                           |  check auth_sessions row   |
+   |                           |--- 200 ------------------->|
+```
 
-### 5.2 Demo limitations
+1. **The operator issues a code.** `bun run auth:code -- --label "alice"`
+   creates a demo user (or reuses one via `--user <uuid>`) and an
+   `access_codes` row. The raw code is printed **once** and never stored —
+   only its SHA-256 hash is persisted.
+2. **The user enters the code** on `/login`. The frontend posts it to
+   `POST /api/v1/auth/login`.
+3. **The backend verifies the code** (hash match, not expired, not revoked,
+   not already redeemed) and, in the same transaction, claims it as redeemed
+   and inserts an `auth_sessions` row whose `id` becomes the token's `jti`.
+4. **The backend returns a JWT** plus its expiry. The frontend stores it in
+   `localStorage`.
+5. **Every subsequent request** carries `Authorization: Bearer <token>`. The
+   backend verifies the signature and `exp`, then confirms the `auth_sessions`
+   row still exists and is not revoked.
+6. **Logout** sets `revoked_at` on that row, so the token stops working
+   immediately rather than at expiry.
 
-This is not production-grade account authentication. Document clearly
-that: - There is no real signup, password, or OAuth. - Demo users may
-share a demo workspace if the implementation deliberately uses one
-shared demo principal. - The demo mode must not be presented as secure
-multi-tenant identity. - Before public production use, replace demo auth
-with a proper identity provider and retain the same `userId` ownership
-model.
+### 5.2 Why a bearer token instead of a cookie
 
-### 5.3 Session endpoints
+The previous implementation used an `HttpOnly` session cookie plus a
+double-submit CSRF token. That was replaced because:
+
+-   **Cross-site cookies were fragile.** The frontend (`*.vercel.app`) and API
+    (`*.up.railway.app`) are on different registrable domains, so
+    `SameSite=Lax` cookies were never sent and the session silently vanished.
+    Making it work required `SameSite=None; Secure`, which is a weaker
+    default and still depends on third-party-cookie policy.
+-   **CSRF does not apply to bearer tokens.** A browser never attaches an
+    `Authorization` header on its own, so a cross-site form post or image tag
+    cannot carry the credential. The attack CSRF defends against is
+    structurally impossible here, so the CSRF token was removed rather than
+    carried along as ceremony.
+-   **The `Origin` allow-list is kept** as defence in depth on every unsafe
+    method (section 14).
+
+**Tradeoff, stated plainly:** `localStorage` is readable by any script running
+on the frontend origin, so an XSS bug could exfiltrate the token. Mitigations:
+a 24-hour expiry, immediate server-side revocation on logout, no third-party
+scripts, and React's default output escaping. A future hardening step is to
+move the token to an `HttpOnly` cookie scoped to a shared parent domain, which
+would reintroduce the need for CSRF protection.
+
+### 5.3 Token format
+
+HS256, hand-rolled in `backend/src/modules/auth/jwt.ts` using `node:crypto`
+(no new dependency). Claims:
+
+| Claim | Meaning |
+| --- | --- |
+| `sub` | user id |
+| `jti` | `auth_sessions.id` — the revocation handle |
+| `iat` | issued-at, seconds |
+| `exp` | expiry, seconds |
+
+Verification rules, all enforced in `verifyAccessToken`:
+
+-   exactly three dot-separated segments;
+-   header `alg` must be `HS256` — the algorithm is **never** taken from the
+    token, which defeats `alg: none` and algorithm-confusion attacks;
+-   signature compared with `timingSafeEqual` (constant time, no early exit on
+    length mismatch);
+-   `sub` and `jti` must be non-empty strings;
+-   `exp` must be in the future.
+
+Any failure returns `null`, and `null` is always treated as unauthenticated.
+There is no partial-trust result.
+
+### 5.4 Two-layer validation
+
+A JWT alone cannot be withdrawn, so validation is deliberately redundant:
+
+1. **Stateless** — signature and `exp`. Cheap, no database round trip.
+2. **Stateful** — the `auth_sessions` row must exist, be unrevoked, be
+   unexpired, and its `user_id` must equal the token's `sub`.
+
+Layer 2 is what makes logout immediate. It costs one indexed primary-key
+lookup per request, which is the correct trade for a revocable credential.
+
+### 5.5 Endpoints
 
 ``` http
-POST /api/v1/auth/demo
-GET  /api/v1/auth/session
-POST /api/v1/auth/logout
+POST /api/v1/auth/login     { "code": "9GGCN-SKFAC" }  -> 200 { token, expiresAt, user }
+GET  /api/v1/auth/session                              -> 200 { token, expiresAt, user }
+POST /api/v1/auth/logout                               -> 204
 ```
+
+`/auth/login` is the only unauthenticated endpoint that mutates state, and it
+is rate limited by the `auth.login` rule (10 per 15 minutes per IP).
+
+`/auth/session` echoes the caller's own token back so a page reload can
+rehydrate without a second login round trip.
+
+### 5.6 Configuration
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `JWT_SECRET` | *(required, min 32 chars)* | HS256 signing key. Rotating it invalidates every issued token — the "sign everyone out" lever. |
+| `JWT_TTL_HOURS` | `24` | Token lifetime. The user re-enters a code after this. |
+| `ACCESS_CODE_SINGLE_USE` | `true` | Whether a code can be redeemed more than once. |
+| `ACCESS_CODE_TTL_HOURS` | `720` (30 days) | How long an unused code stays redeemable. |
+
+Generate a secret with `openssl rand -base64 48`.
+
+### 5.7 Issuing codes
+
+``` bash
+# Local
+cd backend && bun run auth:code -- --label "alice"
+
+# Against the deployed database
+railway run --service blueberrylabs-backend bun run auth:code -- --label "alice"
+
+# Another code for an existing user (e.g. a second device)
+bun run auth:code -- --user <uuid> --label "second device"
+```
+
+The code is 10 alphanumerics, displayed grouped as `ABCDE-FGHIJ`. Input is
+normalised (separators stripped, case folded) before hashing, so
+`abcde-fghij`, `ABCDE FGHIJ`, and `ABCDEFGHIJ` all resolve to the same row.
+
+### 5.8 Demo limitations
+
+This is not production-grade account authentication. Documented plainly:
+
+-   There is no signup, password, OAuth, or email verification. Codes are
+    issued by an operator out of band.
+-   There is no per-user profile, password reset, or account recovery.
+-   A code is a bearer credential: anyone who has it can sign in until it is
+    redeemed (if single-use) or expires.
+-   Demo mode must not be presented as secure multi-tenant identity.
+-   Before public production use, replace this with a proper identity provider
+    and retain the same `userId` ownership model — every route already derives
+    `userId` from the verified token, so the swap is contained to
+    `modules/auth/` and `middleware/auth.ts`.
+
+### 5.9 What was removed
+
+The cookie + CSRF implementation was deleted, not left dormant:
+
+-   `demo_sessions` table (kept in the schema for the migration history, no
+    longer written to; the cleanup function still prunes it).
+-   `bl_session` / `bl_csrf` cookies, `SESSION_COOKIE`, `CSRF_COOKIE`,
+    `parseCookies`, `sessionCookie`, `csrfCookie`, `clearSessionCookies`,
+    `verifyCsrf`.
+-   `COOKIE_SECURE`, `COOKIE_SAME_SITE`, `DEMO_SESSION_SECRET`,
+    `DEMO_SESSION_TTL_HOURS` environment variables.
+-   `POST /api/v1/auth/demo`.
+-   The `X-CSRF-Token` CORS allowed header (replaced by `Authorization`).
+-   `CSRF_TOKEN_INVALID` is still a valid error code in the contracts package
+    for compatibility, but nothing emits it.
 
 ------------------------------------------------------------------------
 
@@ -707,18 +847,62 @@ Demo identity table.
   `kind`         text          `DEMO` for MVP
   `created_at`   timestamptz   Default now
 
-### 8.2 `demo_sessions`
+### 8.2 `access_codes`
+
+The only way to obtain a token (section 5).
 
   Column         Type                   Notes
-  -------------- ---------------------- -----------------------------------
-  `id`           uuid PK                Session ID
-  `user_id`      uuid FK                References users
-  `token_hash`   text unique            Store hash, not raw session token
-  `expires_at`   timestamptz            Session expiry
+  -------------- ---------------------- ------------------------------------------------
+  `id`           uuid PK                Code ID
+  `code_hash`    text unique            SHA-256 of the normalised code; raw code never stored
+  `user_id`      uuid FK                References users (cascade delete)
+  `label`        text nullable          Operator note, e.g. who the code was issued to
+  `expires_at`   timestamptz            After this the code is refused
+  `redeemed_at`  timestamptz nullable   Set on first successful login (single-use)
+  `revoked_at`   timestamptz nullable   Manual revocation
   `created_at`   timestamptz            Default now
-  `revoked_at`   timestamptz nullable   Logout/revocation
 
-### 8.3 `assets`
+Indexes: unique on `code_hash` (the login lookup), plus `user_id` and
+`expires_at` for the retention sweep.
+
+Single-use is enforced by `UPDATE ... WHERE redeemed_at IS NULL RETURNING id`
+inside the login transaction, so two concurrent redemptions of one code yield
+exactly one token (covered by an integration test).
+
+### 8.3 `auth_sessions`
+
+One row per issued token. The row **is** the revocation record.
+
+  Column         Type                   Notes
+  -------------- ---------------------- ------------------------------------------------
+  `id`           uuid PK                Equals the JWT `jti`
+  `user_id`      uuid FK                References users (cascade delete)
+  `expires_at`   timestamptz            Mirrors the token `exp`
+  `revoked_at`   timestamptz nullable   Set by logout; makes the token fail immediately
+  `created_at`   timestamptz            Default now
+
+Indexes: `user_id` and `expires_at`.
+
+`id` is supplied by the application (not `defaultRandom()`) because it must
+equal the `jti` minted into the token.
+
+### 8.4 `demo_sessions` (legacy, unused)
+
+The pre-JWT cookie session table. Retained so the migration history stays
+linear and so the cleanup function can still prune old rows; nothing writes to
+it any more. It will be dropped in a future migration.
+
+  Column             Type                   Notes
+  ------------------ ---------------------- -----------------------------------
+  `id`               uuid PK                Session ID
+  `user_id`          uuid FK                References users
+  `token_hash`       text unique            Hashed session token
+  `csrf_token_hash`  text                   Hashed CSRF token
+  `expires_at`       timestamptz            Session expiry
+  `created_at`       timestamptz            Default now
+  `revoked_at`       timestamptz nullable   Logout/revocation
+
+### 8.5 `assets`
 
   Column                Type                   Notes
   --------------------- ---------------------- ----------------------------------------
@@ -738,7 +922,7 @@ Demo identity table.
 
 Indexes: - `(user_id, created_at DESC)` - `(upload_status, created_at)`
 
-### 8.4 `generations`
+### 8.6 `generations`
 
   Column              Type                   Notes
   ------------------- ---------------------- -----------------------------------------------
@@ -767,7 +951,7 @@ user as the generation.
 Indexes: - `(user_id, created_at DESC)` - `(status, created_at)` -
 `(input_asset_id)`
 
-### 8.5 `jobs`
+### 8.7 `jobs`
 
   -----------------------------------------------------------------------
   Column                  Type                    Notes
@@ -808,7 +992,7 @@ Indexes: - `(user_id, created_at DESC)` - `(status, created_at)` -
 Indexes: - `(status, run_at, priority, created_at)` - `(locked_at)` for
 stale-job recovery.
 
-### 8.6 `rate_limit_buckets`
+### 8.8 `rate_limit_buckets`
 
   Column            Type          Notes
   ----------------- ------------- ---------------------------------
@@ -817,7 +1001,7 @@ stale-job recovery.
   `request_count`   integer       Counter
   `expires_at`      timestamptz   Cleanup time
 
-### 8.7 `generation_events`
+### 8.9 `generation_events`
 
   -----------------------------------------------------------------------
   Column                  Type                    Notes
@@ -843,7 +1027,7 @@ stale-job recovery.
 Use this table for audit/debug history, not as the primary status
 response. The current `generations` row remains the source of truth.
 
-### 8.8 Schema and migration rules
+### 8.10 Schema and migration rules
 
 -   Use Drizzle schema definitions and checked-in SQL migrations.
 -   Never use automatic destructive schema synchronization in
@@ -1116,11 +1300,29 @@ upload.
 
 ### 12.1 Authentication
 
-  Method   Path              Purpose
-  -------- ----------------- ----------------------------------
-  POST     `/auth/demo`      Create demo session
-  GET      `/auth/session`   Return current session/principal
-  POST     `/auth/logout`    Revoke session and clear cookie
+  Method   Path              Auth   Purpose
+  -------- ----------------- ------ -------------------------------------------
+  POST     `/auth/login`     none   Exchange an access code for a JWT
+  GET      `/auth/session`   bearer Return the current principal
+  POST     `/auth/logout`    bearer Revoke the current token (204)
+
+`POST /auth/login` request and response:
+
+``` json
+// request
+{ "code": "9GGCN-SKFAC" }
+
+// 200
+{
+  "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9....",
+  "expiresAt": "2026-11-06T16:50:00.000Z",
+  "user": { "id": "uuid", "kind": "DEMO" }
+}
+```
+
+Every other endpoint requires `Authorization: Bearer <token>`. A missing,
+malformed, tampered, expired, or revoked token yields `401 UNAUTHENTICATED`
+before the route handler runs. There is no CSRF token (section 5.2).
 
 ### 12.2 Uploads and assets
 
@@ -1300,10 +1502,16 @@ still work.
 -   Decode/inspect image data with Sharp before accepting it for
     processing.
 -   Use generated object keys, not original filenames.
--   Avoid logging session cookies, authorization headers, signed URLs,
-    or secret values.
--   Apply CSRF protection if cookie-based authentication is used.
--   Set secure cookie attributes in production.
+-   Avoid logging authorization headers, signed URLs, access codes, or
+    secret values.
+-   Verify the JWT signature and expiry on every authenticated request, and
+    check the `auth_sessions` row so revocation is immediate (section 5.4).
+-   Never read the signing algorithm from the token header (defeats
+    `alg: none` and algorithm confusion).
+-   Compare signatures in constant time.
+-   Store only hashes of access codes; never persist or log the raw code.
+-   CSRF protection is not applicable to bearer tokens (section 5.2). If the
+    token is ever moved into a cookie, CSRF protection becomes mandatory again.
 -   Use parameterized SQL/Drizzle queries.
 -   Apply request body size limits.
 -   Use safe error messages and centralized error handling.
@@ -1407,8 +1615,11 @@ DATABASE_URL=postgresql://...
 WEB_ORIGIN=http://localhost:3000
 API_PUBLIC_URL=http://localhost:3001
 
-DEMO_SESSION_SECRET=replace-with-long-random-secret
-DEMO_SESSION_TTL_HOURS=24
+# openssl rand -base64 48
+JWT_SECRET=replace-with-at-least-32-random-chars
+JWT_TTL_HOURS=24
+ACCESS_CODE_SINGLE_USE=true
+ACCESS_CODE_TTL_HOURS=720
 
 RAILWAY_BUCKET_ENDPOINT=
 RAILWAY_BUCKET_REGION=
@@ -1457,10 +1668,10 @@ dashboard uses these exact names.
 NEXT_PUBLIC_API_BASE_URL=http://localhost:3001
 ```
 
-If using cross-origin cookies between Vercel and Railway, configure the
-cookie domain/same-site behavior and CORS/credentials correctly. Prefer
-a same-site custom domain arrangement where possible. Never put bucket
-credentials in `NEXT_PUBLIC_*` variables.
+The frontend authenticates with a bearer JWT, so no cookie configuration is
+needed and `credentials: "include"` is not used. CORS must still allow the
+`Authorization` request header. Never put bucket credentials or `JWT_SECRET`
+in `NEXT_PUBLIC_*` variables.
 
 ------------------------------------------------------------------------
 
@@ -1579,15 +1790,15 @@ command consistent with the frontend submodule's package manager. -
 Preview deployment origins if preview deployments are supported; do not
 automatically trust every preview origin in production API CORS.
 
-### 18.3 CORS and cookies
+### 18.3 CORS and auth headers
 
 -   Allow only explicit frontend origins.
--   Allow required methods and headers.
--   Enable credentials only if cookie-based session auth requires it.
+-   Allow required methods and headers — `Authorization` is required for the
+    bearer token, alongside `Content-Type`, `Idempotency-Key`, and
+    `X-Request-Id`.
+-   Credentials are **not** enabled: there are no cookies to send.
 -   Never combine credentialed requests with wildcard origins.
--   Test production Vercel-to-Railway cookie behavior in a real browser.
--   Configure Railway Bucket CORS separately for direct browser PUT
-    uploads.
+-   Configure Railway Bucket CORS separately for direct browser PUT uploads.
 
 ### 18.4 Database migrations
 
@@ -1626,7 +1837,7 @@ concurrency correctness.
 
 At least one full browser test must cover:
 
-1.  Enter demo account.
+1.  Enter an access code and receive a JWT.
 2.  Upload a supported image.
 3.  Observe upload progress.
 4.  Select Instagram portrait.
@@ -1973,7 +2184,7 @@ Deployment:
 
 **MVP end-to-end milestone:**
 
-> Enter demo account → upload an image directly to Railway Bucket →
+> Enter an access code → receive a JWT → upload an image directly to Railway Bucket →
 > choose Instagram/TikTok/YouTube preset → create generation →
 > PostgreSQL job is claimed by the background loop in the Elysia process
 > → Sharp resizes/crops the image → output is uploaded to Railway Bucket
@@ -2046,9 +2257,10 @@ upload → generate → download flow.
 6. **The `Origin` check runs globally in `onBeforeHandle`.** It is not left to
    individual routes; a per-route check was measurably skippable on
    unauthenticated paths such as logout.
-7. **CSRF requires the header strictly.** The `bl_csrf` cookie is *not* accepted
-   as a fallback for the header; accepting it would let anyone able to write
-   cookies bypass the double-submit check.
+7. **Auth is a bearer JWT, not a cookie.** The token is verified statelessly
+   (signature + `exp`) and then against its `auth_sessions` row, so logout is
+   immediate. There is no CSRF token because browsers never attach an
+   `Authorization` header on their own (section 5.2).
 8. **`Worker.runOnce()` exists for deterministic testing and operational drain.**
    The production path is still the polling loop.
 
@@ -2064,7 +2276,9 @@ backend/
 │   ├── config/env.ts              # zod-validated environment (fail fast)
 │   ├── db/{client,schema,migrate}  # drizzle + checked-in migrations
 │   ├── middleware/                # auth, origin, rate-limit, request-context, error-handler
-│   ├── modules/                   # auth, uploads(+assets), generations, health
+│   ├── modules/                   # auth (jwt.ts, session.ts, routes.ts), uploads(+assets),
+│   │                              # generations, health
+│   ├── cli/                       # issue-access-code.ts (operator tool)
 │   ├── queue/                     # worker, claim-job, retry, handlers/process-image
 │   ├── services/                  # storage/{interface,railway-bucket,filesystem},
 │   │                              # image/sharp-processor, generation/{service,quota}
@@ -2075,8 +2289,8 @@ backend/
 
 Notable additions beyond the planned tree: `services/generation/quota-service.ts`
 (daily + concurrency quotas and ownership checks live in one place),
-`services/storage/local-routes.ts`, `observability/cleanup.ts`, and
-`middleware/origin.ts`.
+`services/storage/local-routes.ts`, `observability/cleanup.ts`,
+`middleware/origin.ts`, `modules/auth/jwt.ts`, and `cli/issue-access-code.ts`.
 
 ### 27.4 Behavioural contracts worth knowing before changing code
 
@@ -2193,7 +2407,7 @@ These are intentionally unimplemented rather than faked:
 | Item | State |
 | --- | --- |
 | Railway Bucket presigned PUT/GET against live buckets | **Verified live** — presigned PUT 200, presigned GET 200, objects present in both buckets |
-| Vercel ↔ Railway cross-site cookie behaviour | **Verified live** — requires `COOKIE_SAME_SITE=none` (see 27.8) |
+| Vercel ↔ Railway cross-site auth | **Resolved** — replaced cookies with bearer JWTs, so cross-site cookie policy no longer applies (see 5.2 and 27.8) |
 | Sentry | Seam only (`SENTRY_DSN`); wiring the SDK is a follow-up |
 | OpenTelemetry | Documented partial: correlation ids always emitted, OTLP exporter not attached |
 | Multi-replica metrics | `/metrics` is per process; scraping must be per replica |
@@ -2228,30 +2442,27 @@ origins `https://blueberrylabs-frontend.vercel.app` and
 preflight returning `Access-Control-Allow-Origin`. Add any new frontend origin
 to both buckets, or browser uploads will be blocked.
 
-### Cross-site cookies (the subtle one)
+### Cross-site auth: why cookies were replaced
 
 `*.vercel.app` and `*.up.railway.app` are **different registrable domains**, so
-the browser treats every API call as cross-site. With the default
-`SameSite=Lax`, the session cookie is never sent and every authenticated request
-returns 401 — with no error at login time, which makes it look like a backend
-bug.
+the browser treats every API call as cross-site. With the original cookie
+session and the default `SameSite=Lax`, the session cookie was never sent and
+every authenticated request returned 401 — with no error at login time, which
+made it look like a backend bug. Working around it required
+`SameSite=None; Secure` plus a CSRF token read from the response body, because
+the API's `bl_csrf` cookie was unreadable from the frontend's origin.
 
-Production therefore sets:
+That whole class of problem is gone now: the credential is a bearer JWT in an
+`Authorization` header, which the browser never attaches automatically. There
+are no cookies, no `SameSite` policy, and no CSRF token. See section 5.2 for the
+reasoning and the `localStorage` XSS tradeoff.
+
+Production therefore sets only:
 
 ```env
-COOKIE_SAME_SITE=none
-COOKIE_SECURE=true
+JWT_SECRET=<openssl rand -base64 48>
+JWT_TTL_HOURS=24
 ```
-
-`SameSite=None` is only honoured together with `Secure`, so the auth routes
-refuse to emit that combination otherwise. If the frontend and API are later put
-behind one registrable domain (for example `app.example.com` and
-`api.example.com`), revert to `lax` — it is the safer default.
-
-A second consequence: the API's `bl_csrf` cookie lives on the API's origin and
-is unreadable from the frontend's JavaScript. The frontend therefore takes the
-CSRF token from the auth **response body** and keeps it in memory, falling back
-to the cookie only for same-origin setups.
 
 `railway up` needs `--path-as-root`; without it the archive is prefixed by the
 project directory and Railway falls back to Railpack, which fails with
@@ -2264,6 +2475,48 @@ bun run verify          # lint + typecheck + test, both submodules
 bun run contracts:sync  # after changing backend/contracts (self-verifies)
 cd backend && bun test  # boots a throwaway PostgreSQL if none is configured
 
+# Issue a login code
+cd backend && bun run auth:code -- --label "alice"
+
 # Reproduce what CI does for the container:
 cd backend && docker build --no-cache -t blueberrylabs-backend:ci .
 ```
+
+### 27.10 JWT auth: implementation map and test coverage
+
+Files that make up the auth flow, in the order a request touches them:
+
+| File | Role |
+| --- | --- |
+| `backend/src/modules/auth/jwt.ts` | HS256 sign/verify. Fixed algorithm, constant-time compare, `exp` enforced. |
+| `backend/src/modules/auth/session.ts` | `loginWithCode`, `authenticate`, `revokeSession`, `createAccessCode`, `createDemoUserWithCode`, `deleteExpiredSessions`. |
+| `backend/src/middleware/auth.ts` | `bearerToken()` parses the header; `requireSession()` verifies and populates the request context. |
+| `backend/src/modules/auth/routes.ts` | `POST /login`, `GET /session`, `POST /logout`. |
+| `backend/src/cli/issue-access-code.ts` | Operator CLI (`bun run auth:code`). |
+| `backend/src/db/schema/index.ts` | `access_codes`, `auth_sessions`. |
+| `backend/src/db/migrations/0002_jwt_auth.sql` | Creates both tables and their indexes. |
+| `backend/src/db/migrations/0003_cleanup_jwt_auth.sql` | Extends `cleanup_expired_rows()` to prune both. |
+| `frontend/lib/api-client.ts` | `getToken`/`setToken`/`readAuthToken`; attaches `Authorization` on every request. |
+| `frontend/lib/auth.ts` | `loadSession`, `login`, `endSession`. |
+| `frontend/components/session/session-provider.tsx` | `signIn(code)`, `signOut()`. |
+| `frontend/app/login/page.tsx` | Access-code form. |
+
+Test coverage added for this flow:
+
+| Suite | What it pins |
+| --- | --- |
+| `backend/test/unit/jwt.test.ts` | Round-trip, TTL, HS256 header, wrong secret, tampered payload, expired, `alg:none` downgrade, malformed input, missing claims. |
+| `backend/test/integration/auth.test.ts` | Code → token, 24h TTL, separator/case normalisation, unknown/expired/revoked code, single-use, **8 concurrent redemptions yield exactly 1 token**, raw code never stored, schema validation, Bearer accepted, missing/malformed/forged/tampered/wrong-secret/expired token rejected, deleted session row rejected, logout revokes immediately, logout does not affect sibling sessions, origin allow-list. |
+| `frontend/test/token-storage.test.ts` | Read/write/clear, SSR returns `null`, storage that throws does not crash. |
+
+Live end-to-end verification (14 checks, all passing) exercised the real HTTP
+server against a real PostgreSQL database: login, 24h TTL, Bearer accepted,
+no-token 401, tampered-signature 401, garbage-token 401 on a protected route,
+valid token 200 on a protected route, code reuse 401, logout 204, token dead
+after logout, raw code absent from the database, and CORS advertising
+`Authorization`.
+
+**Deliberate non-goals** (documented rather than hidden): no refresh token, no
+token rotation, no per-device session listing, no rate limit on `/auth/session`
+beyond the general limiter. A 24-hour token with immediate revocation was the
+requested behaviour.
