@@ -117,9 +117,14 @@ added without redesigning the API.
                                       S3-compatible test service if
                                       desired
 
-  Monorepo                            pnpm workspaces (or Bun workspaces
-                                      if the agent verifies compatibility
-                                      across all packages)
+  Repository layout                   Parent repository containing two git
+                                      submodules: `blueberrylabs-backend/` and
+                                      `blueberrylabs-frontend/`. Each submodule is its
+                                      own independent git repository.
+
+  Package management                  Bun workspaces
+                                      inside each submodule, never across
+                                      submodule boundaries
   -----------------------------------------------------------------------
 
 ### 2.1 Runtime boundary
@@ -235,99 +240,189 @@ and by the browser only through short-lived presigned URLs.
 
 ## 4. Repository structure
 
-Use a monorepo:
+### 4.1 Repository topology
+
+This project is **not** a single monorepo. It is a parent repository that
+contains two git submodules:
 
 ``` text
-social-content-resizer/
-├── apps/
-│   ├── web/
-│   │   ├── app/
-│   │   │   ├── (app)/
-│   │   │   │   ├── page.tsx
-│   │   │   │   ├── generations/[id]/page.tsx
-│   │   │   │   └── history/page.tsx
-│   │   │   ├── api/                 # Only if a Next.js proxy is genuinely needed
-│   │   │   ├── login/page.tsx       # Demo entry point
-│   │   │   ├── layout.tsx
-│   │   │   └── globals.css
-│   │   ├── components/
-│   │   │   ├── upload/
-│   │   │   ├── presets/
-│   │   │   ├── generation/
-│   │   │   └── ui/
-│   │   ├── hooks/
-│   │   │   ├── use-upload.ts
-│   │   │   └── use-generation-polling.ts
-│   │   ├── lib/
-│   │   │   ├── api-client.ts
-│   │   │   ├── auth.ts
-│   │   │   └── validation.ts
-│   │   └── package.json
-│   │
-│   └── api/
-│       ├── src/
-│       │   ├── app.ts
-│       │   ├── server.ts
-│       │   ├── config/
-│       │   │   ├── env.ts
-│       │   │   └── presets.ts
-│       │   ├── db/
-│       │   │   ├── client.ts
-│       │   │   ├── schema/
-│       │   │   └── migrations/
-│       │   ├── middleware/
-│       │   │   ├── auth.ts
-│       │   │   ├── rate-limit.ts
-│       │   │   ├── request-context.ts
-│       │   │   └── error-handler.ts
-│       │   ├── modules/
-│       │   │   ├── auth/
-│       │   │   ├── uploads/
-│       │   │   ├── assets/
-│       │   │   ├── generations/
-│       │   │   ├── jobs/
-│       │   │   └── health/
-│       │   ├── queue/
-│       │   │   ├── worker.ts
-│       │   │   ├── claim-job.ts
-│       │   │   ├── retry.ts
-│       │   │   └── handlers/
-│       │   │       └── process-image.ts
-│       │   ├── services/
-│       │   │   ├── storage/
-│       │   │   │   ├── storage.interface.ts
-│       │   │   │   └── railway-bucket.ts
-│       │   │   ├── image/
-│       │   │   │   └── sharp-processor.ts
-│       │   │   └── generation/
-│       │   │       └── generation-service.ts
-│       │   ├── observability/
-│       │   │   ├── logger.ts
-│       │   │   ├── metrics.ts
-│       │   │   └── tracing.ts
-│       │   └── utils/
-│       ├── drizzle.config.ts
-│       ├── package.json
-│       └── Dockerfile
-│
-├── packages/
-│   └── shared/
-│       ├── src/
-│       │   ├── contracts/
-│       │   ├── types/
-│       │   └── presets/
-│       └── package.json
-│
+blueberrylabs/                 # parent repository (this repo)
+├── backend/                   # git submodule -> its own repository
+├── frontend/                  # git submodule -> its own repository
+├── .gitmodules
 ├── docker-compose.yml
-├── package.json
-├── pnpm-workspace.yaml
+├── package.json               # root convenience scripts only
 ├── .env.example
 ├── README.md
 └── ARCHITECTURE.md
 ```
 
+Rules:
+
+-   `backend/` and `frontend/` are **independent git repositories** with
+    their own history, branches, tags, CI, and release cadence.
+-   The parent repository tracks only a pinned commit for each submodule.
+    It must never contain application source code for either side.
+-   Never copy files between `backend/` and `frontend/`. Share contracts
+    through a published package or generated client, not by copying.
+-   Each submodule owns its own lockfile. Do not create a lockfile at the
+    parent root that resolves application dependencies.
+-   The parent repository owns only cross-cutting assets: the
+    architecture document, local orchestration (Docker Compose), and
+    convenience scripts that delegate into the submodules.
+
+### 4.2 Parent repository scripts
+
+The parent `package.json` exists only to delegate. It must not declare
+application dependencies. Root scripts must delegate rather than
+duplicate logic:
+
+``` json
+{
+  "scripts": {
+    "dev": "bun --cwd backend run dev & bun --cwd frontend run dev",
+    "test": "bun --cwd backend run test && bun --cwd frontend run test",
+    "lint": "bun --cwd backend run lint && bun --cwd frontend run lint",
+    "typecheck": "bun --cwd backend run typecheck && bun --cwd frontend run typecheck"
+  }
+}
+```
+
+Use the package manager each submodule actually declares; the snippet
+above is illustrative, not prescriptive.
+
+### 4.3 `backend/` submodule layout
+
+``` text
+backend/
+├── src/
+│   ├── app.ts
+│   ├── server.ts
+│   ├── config/
+│   │   ├── env.ts
+│   │   └── presets.ts
+│   ├── db/
+│   │   ├── client.ts
+│   │   ├── schema/
+│   │   └── migrations/
+│   ├── middleware/
+│   │   ├── auth.ts
+│   │   ├── rate-limit.ts
+│   │   ├── request-context.ts
+│   │   └── error-handler.ts
+│   ├── modules/
+│   │   ├── auth/
+│   │   ├── uploads/
+│   │   ├── assets/
+│   │   ├── generations/
+│   │   ├── jobs/
+│   │   └── health/
+│   ├── queue/
+│   │   ├── worker.ts
+│   │   ├── claim-job.ts
+│   │   ├── retry.ts
+│   │   └── handlers/
+│   │       └── process-image.ts
+│   ├── services/
+│   │   ├── storage/
+│   │   │   ├── storage.interface.ts
+│   │   │   └── railway-bucket.ts
+│   │   ├── image/
+│   │   │   └── sharp-processor.ts
+│   │   └── generation/
+│   │       └── generation-service.ts
+│   ├── observability/
+│   │   ├── logger.ts
+│   │   ├── metrics.ts
+│   │   └── tracing.ts
+│   └── utils/
+├── drizzle.config.ts
+├── package.json
+├── Dockerfile
+└── README.md
+```
+
+### 4.4 `frontend/` submodule layout
+
+``` text
+frontend/
+├── app/
+│   ├── (app)/
+│   │   ├── page.tsx
+│   │   ├── generations/[id]/page.tsx
+│   │   └── history/page.tsx
+│   ├── api/                 # Only if a Next.js proxy is genuinely needed
+│   ├── login/page.tsx       # Demo entry point
+│   ├── layout.tsx
+│   └── globals.css
+├── components/
+│   ├── upload/
+│   ├── presets/
+│   ├── generation/
+│   └── ui/
+├── hooks/
+│   ├── use-upload.ts
+│   └── use-generation-polling.ts
+├── lib/
+│   ├── api-client.ts
+│   ├── auth.ts
+│   └── validation.ts
+├── package.json
+└── README.md
+```
+
 The agent may adjust file names to fit the chosen libraries, but must
 preserve the module boundaries and responsibilities.
+
+### 4.5 Submodule workflow
+
+Initial setup, performed once by the agent:
+
+``` bash
+git submodule add <backend-repo-url> backend
+git submodule add <frontend-repo-url> frontend
+git commit -m "Add backend and frontend submodules"
+```
+
+Cloning and updating:
+
+``` bash
+git clone --recurse-submodules <parent-repo-url>
+git submodule update --init --recursive
+git submodule update --remote --merge   # advance to each submodule's tip
+```
+
+Rules:
+
+-   Commit inside a submodule first, push it, then commit the updated
+    submodule pointer in the parent repository. Never commit a pointer to
+    an unpushed submodule commit.
+-   Pin submodules to a branch (`branch = main` in `.gitmodules`) so
+    `--remote` updates are predictable.
+-   CI for each submodule lives in that submodule's repository. The
+    parent repository CI only verifies that both submodules are
+    initialized and that their pinned commits build.
+-   A change that spans both sides is two commits in two repositories
+    plus one pointer update in the parent. Document the pairing in the
+    parent commit message.
+-   Do not use `git submodule foreach` to run application tests; run each
+    submodule's own scripts.
+
+### 4.6 Shared contracts across the submodule boundary
+
+Because the two applications no longer share a workspace, shared
+TypeScript contracts must be distributed explicitly:
+
+-   The backend is authoritative for request/response shapes and
+    platform presets.
+-   Publish the contracts as a versioned package (for example
+    `@social-resizer/contracts`) from the backend repository, or generate
+    a typed client from the Elysia OpenAPI document.
+-   The frontend consumes a pinned version and upgrades deliberately.
+-   Never import across the submodule boundary with relative paths such
+    as `../backend/src/...`.
+-   The frontend must still treat API responses as runtime-untrusted
+    data even when typed by the shared package.
 
 ------------------------------------------------------------------------
 
@@ -1293,9 +1388,14 @@ without making the endpoint slow or exposing secrets.
 
 ## 16. Configuration and environment variables
 
-Create `.env.example` with placeholders only.
+Create `.env.example` with placeholders only. Because the applications
+live in separate repositories, each submodule owns its own
+`.env.example` (`backend/.env.example`, `frontend/.env.example`). The
+parent repository may keep a root `.env.example` that documents both
+sides for local orchestration, but it must contain placeholders only and
+must never be the file the applications load at runtime.
 
-### Backend
+### Backend (`backend/.env.example`)
 
 ``` env
 NODE_ENV=development
@@ -1351,7 +1451,7 @@ the Railway dashboard's generated connection variables. Map those values
 into the application-specific variables above. Do not assume the
 dashboard uses these exact names.
 
-### Frontend
+### Frontend (`frontend/.env.example`)
 
 ``` env
 NEXT_PUBLIC_API_BASE_URL=http://localhost:3001
@@ -1368,9 +1468,13 @@ credentials in `NEXT_PUBLIC_*` variables.
 
 ### 17.1 Prerequisites
 
--   Bun version pinned in `package.json` or `.tool-versions`.
+-   Git with submodule support, and access to both submodule
+    repositories.
+-   Bun version pinned in `backend/package.json` or
+    `backend/.tool-versions`.
 -   Node.js only if required by tooling; application API runtime is Bun.
--   pnpm or Bun workspace tooling, chosen consistently.
+-   pnpm or Bun workspace tooling, chosen consistently **within each
+    submodule**.
 -   Docker Desktop for local PostgreSQL.
 -   Railway account/project and Railway Bucket credentials for storage
     integration testing.
@@ -1405,21 +1509,38 @@ Do not commit real credentials.
 
 ### 17.3 Local commands
 
-The agent must provide working root scripts similar to:
+The agent must provide working scripts in each submodule, plus root
+scripts that delegate to them:
 
 ``` bash
-bun install
+# parent repository
+git submodule update --init --recursive
 docker compose up -d postgres
+npm run dev          # delegates to backend and frontend
+npm run test
+npm run lint
+npm run typecheck
+
+# backend/ submodule
+bun install
 bun run db:generate
 bun run db:migrate
 bun run dev
 bun run test
 bun run lint
 bun run typecheck
+
+# frontend/ submodule
+bun install
+bun run dev
+bun run test
+bun run lint
+bun run typecheck
 ```
 
-If pnpm is selected, use pnpm consistently instead of mixing package
-managers.
+If pnpm is selected, use pnpm consistently within a submodule instead of
+mixing package managers. Do not install application dependencies from the
+parent repository root.
 
 ------------------------------------------------------------------------
 
@@ -1428,8 +1549,11 @@ managers.
 ### 18.1 Railway resources
 
 Create one Railway project with: 1. PostgreSQL service. 2. Backend
-service built from `apps/api`. 3. `media-originals` private Bucket. 4.
-`media-generated` private Bucket.
+service built from the `backend/` submodule repository. 3.
+`media-originals` private Bucket. 4. `media-generated` private Bucket.
+
+Railway must build from the backend repository directly, not from the
+parent repository. The parent repository is not a deployable artifact.
 
 The API service runs both Elysia and the background job loop. Do not
 create a separate worker service for the MVP.
@@ -1447,12 +1571,12 @@ architecture.
 
 ### 18.2 Vercel
 
-Deploy `apps/web` as the Vercel project root.
+Deploy the `frontend/` submodule repository as the Vercel project root.
 
 Configure: - `NEXT_PUBLIC_API_BASE_URL` to the public Railway API URL. -
 Production domain and approved API origin. - Build command and install
-command consistent with the monorepo package manager. - Preview
-deployment origins if preview deployments are supported; do not
+command consistent with the frontend submodule's package manager. -
+Preview deployment origins if preview deployments are supported; do not
 automatically trust every preview origin in production API CORS.
 
 ### 18.3 CORS and cookies
@@ -1528,16 +1652,20 @@ all layers simultaneously before the foundation works.
 
 ### Sprint 0 --- Repository and runtime foundation
 
-Tasks: - Create monorepo and workspace configuration. - Add Next.js
-frontend. - Add Bun + Elysia backend. - Add shared TypeScript
-contracts. - Add environment validation. - Add Docker Compose
+Tasks: - Create the parent repository and add `backend/` and
+`frontend/` as git submodules. - Add Next.js frontend in the `frontend/`
+submodule. - Add Bun + Elysia backend in the `backend/` submodule. - Add
+shared TypeScript contracts as a versioned package consumed by the
+frontend. - Add environment validation. - Add Docker Compose
 PostgreSQL. - Add Railway deployment skeleton and Dockerfile. - Add
-lint, format, typecheck, and test scripts. - Add structured logger and
-request ID middleware.
+lint, format, typecheck, and test scripts in each submodule. - Add
+structured logger and request ID middleware.
 
-Acceptance criteria: - Frontend starts locally. - API starts locally. -
-PostgreSQL is reachable. - `/health/live` and `/health/ready` work. - No
-secrets are committed. - CI or local scripts pass lint/typecheck/tests.
+Acceptance criteria: - `git submodule status` shows both submodules
+initialized at pinned commits. - Frontend starts locally. - API starts
+locally. - PostgreSQL is reachable. - `/health/live` and `/health/ready`
+work. - No secrets are committed. - CI or local scripts pass
+lint/typecheck/tests in each submodule.
 
 ### Sprint 1 --- Database, demo authentication, and rate limiting
 
@@ -1653,8 +1781,10 @@ The MVP should have a clean, focused interface.
 
 ## 22. API and frontend contract ownership
 
--   Keep request/response types in `packages/shared`.
--   Keep platform presets in a shared package, but the backend is
+-   Keep request/response types in a versioned contracts package
+    published from the backend repository and consumed by the frontend
+    submodule.
+-   Keep platform presets in that shared package, but the backend is
     authoritative and validates every selection.
 -   Generate OpenAPI documentation from Elysia where practical.
 -   Avoid duplicating business rules in frontend code.
@@ -1662,6 +1792,8 @@ The MVP should have a clean, focused interface.
     treat API responses as runtime-untrusted data.
 -   Version all public endpoints under `/api/v1`.
 -   Return consistent errors and request IDs.
+-   Never import across the submodule boundary with relative paths; the
+    contracts package is the only shared code channel.
 
 ------------------------------------------------------------------------
 
@@ -1702,8 +1834,12 @@ possible.
 
 The project is complete when all of the following are true:
 
--   [ ] Next.js frontend deployed to Vercel.
--   [ ] Bun/Elysia API deployed to Railway.
+-   [ ] Parent repository contains `backend/` and `frontend/` as git
+    submodules, each pointing at a pushed commit in its own repository.
+-   [ ] Next.js frontend deployed to Vercel from the `frontend/`
+    submodule repository.
+-   [ ] Bun/Elysia API deployed to Railway from the `backend/` submodule
+    repository.
 -   [ ] Railway PostgreSQL configured and migrated.
 -   [ ] Railway private Buckets configured.
 -   [ ] Demo authentication works.
@@ -1736,34 +1872,38 @@ The project is complete when all of the following are true:
 2.  Inspect the existing repository before creating or replacing files.
 3.  Preserve existing working code unless a change is required by this
     architecture.
-4.  Implement one milestone at a time in the order specified.
-5.  Do not silently substitute infrastructure:
+4.  Respect the repository topology in section 4: `backend/` and
+    `frontend/` are separate git repositories mounted as submodules.
+    Never move application code into the parent repository, and never
+    commit a submodule pointer to an unpushed commit.
+5.  Implement one milestone at a time in the order specified.
+6.  Do not silently substitute infrastructure:
     -   Railway Buckets, not S3/Cloudflare/Supabase Storage.
     -   Railway PostgreSQL, not Supabase.
     -   Bun + Elysia API.
     -   Same-process background job loop.
     -   PostgreSQL-backed queue, not Redis or Graphile Worker.
     -   Vercel frontend.
-6.  Verify current Railway Bucket S3-compatible connection details and
+7.  Verify current Railway Bucket S3-compatible connection details and
     presigned URL behavior from Railway's current
     documentation/dashboard. Do not guess endpoint or credential
     variable names.
-7.  Verify browser CORS behavior for direct presigned PUT uploads.
-8.  Do not put secret values in frontend environment variables.
-9.  Do not implement video or AI generation in this MVP.
-10. Do not claim a feature works until it has been run and tested.
-11. After each milestone, report:
+8.  Verify browser CORS behavior for direct presigned PUT uploads.
+9.  Do not put secret values in frontend environment variables.
+10. Do not implement video or AI generation in this MVP.
+11. Do not claim a feature works until it has been run and tested.
+12. After each milestone, report:
     -   Files created/changed.
     -   Design decisions made.
     -   Commands executed.
     -   Tests and results.
     -   Known issues and next milestone.
-12. If a required external credential or Railway resource is
+13. If a required external credential or Railway resource is
     unavailable, implement a clean interface and local test adapter,
     document the missing configuration, and continue with other work.
-13. Avoid speculative abstractions. Keep the implementation small,
+14. Avoid speculative abstractions. Keep the implementation small,
     typed, observable, and testable.
-14. Do not weaken authentication, ownership checks, rate limits, or file
+15. Do not weaken authentication, ownership checks, rate limits, or file
     validation to make the demo pass.
 
 ------------------------------------------------------------------------
@@ -1771,14 +1911,22 @@ The project is complete when all of the following are true:
 ## 26. Final architecture summary
 
 ``` text
+Repository topology:
+  Parent repository (this repo)
+  backend/  -> git submodule, independent repository
+  frontend/ -> git submodule, independent repository
+  Shared contracts distributed as a versioned package, not a workspace
+
 Frontend:
   Next.js + React + TypeScript
   Hosted on Vercel
+  Deployed from the frontend/ submodule repository
 
 Backend:
   Bun + Elysia + TypeScript
   Hosted on Railway
   REST API + same-process background job loop
+  Deployed from the backend/ submodule repository
 
 Database:
   Railway PostgreSQL
@@ -1818,8 +1966,9 @@ Observability:
   Optional Sentry + OpenTelemetry
 
 Deployment:
-  Vercel frontend
-  Railway API + PostgreSQL + Buckets
+  Vercel frontend (from frontend/ submodule repo)
+  Railway API + PostgreSQL + Buckets (from backend/ submodule repo)
+  Parent repository is orchestration and documentation only
 ```
 
 **MVP end-to-end milestone:**
