@@ -1986,9 +1986,9 @@ Deployment:
 > boundaries, or operational behaviour change, update it here rather than
 > letting this document drift from the code.
 
-**Last verified:** 2026-11-05 — `lint`, `typecheck`, and 91 tests pass
-(81 backend, 10 frontend); the full browser flow was exercised against a
-running stack.
+**Last verified:** 2026-11-05 — `lint`, `typecheck`, and 92 tests pass
+(82 backend, 10 frontend) from a cold start with automatic PostgreSQL
+provisioning; the full browser flow was exercised against a running stack.
 
 ### 27.1 Milestone status
 
@@ -2081,6 +2081,15 @@ entirely — used for corrupt images, unsupported presets, and missing sources.
 **Leases** are refreshed every `leaseSeconds / 3`. `recoverStaleJobs(leaseSeconds)`
 requeues or fails expired `RUNNING` jobs and reconciles the generation out of
 `PROCESSING`, so no generation can be stuck in a non-terminal state after a crash.
+
+The recovery sweep must be **one transaction** and must count only transitions
+that actually matched a row (`UPDATE … RETURNING id`). An earlier implementation
+ran in autocommit and counted intent, so six concurrent sweeps over ten stale
+jobs reported 60 recoveries instead of 10 — inflating `jobs_recovered_total` and
+risking the wrong number of generations being reconciled. Two safeguards now
+cover it independently (transaction-scoped `SKIP LOCKED` locks, and
+outcome-based counting), with a regression test in
+`test/integration/queue.test.ts`.
 
 **Idempotency** is layered: a unique `(user_id, idempotency_key)` partial index,
 a payload comparison that returns `409 IDEMPOTENCY_CONFLICT` on mismatch, an
