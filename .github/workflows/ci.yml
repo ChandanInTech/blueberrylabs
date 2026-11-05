@@ -20,7 +20,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+          token: ${{ secrets.SUBMODULE_TOKEN || github.token }}
           fetch-depth: 0
+          # Private submodules cannot be cloned with the default GITHUB_TOKEN
+          # (it is scoped to this repository only). Set a SUBMODULE_TOKEN
+          # secret with read access to both submodule repositories; public
+          # submodules fall back to the default token.
+          token: ${{ secrets.SUBMODULE_TOKEN || github.token }}
 
       - name: Verify both submodules are checked out
         run: |
@@ -96,6 +102,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+          token: ${{ secrets.SUBMODULE_TOKEN || github.token }}
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -121,6 +128,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+          token: ${{ secrets.SUBMODULE_TOKEN || github.token }}
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -151,6 +159,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+          token: ${{ secrets.SUBMODULE_TOKEN || github.token }}
 
       - uses: oven-sh/setup-bun@v2
         with:
