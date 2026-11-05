@@ -6,6 +6,7 @@ Upload from the browser, choose a preset, and the server produces a pixel-perfec
 [![CI](https://github.com/ChandanInTech/blueberrylabs/actions/workflows/ci.yml/badge.svg)](https://github.com/ChandanInTech/blueberrylabs/actions/workflows/ci.yml)
 
 - **Status:** MVP, demo authentication only
+- **Live app:** <https://blueberrylabs-frontend.vercel.app>
 - **Live API:** <https://blueberrylabs-backend-production.up.railway.app> (Railway, PostgreSQL + private buckets)
 - **Full design:** [ARCHITECTURE.md](./ARCHITECTURE.md)
 - **Agent guidance:** [AGENTS.md](./AGENTS.md)
@@ -160,6 +161,12 @@ if you apply them as a separate release step.
 **Frontend → Vercel.** Project root is the `frontend/` repository. Set
 `NEXT_PUBLIC_API_BASE_URL` to the public Railway URL. Never put bucket credentials in
 `NEXT_PUBLIC_*`.
+
+Because `*.vercel.app` and `*.up.railway.app` are different registrable domains, the
+browser treats every API call as cross-site. The backend must therefore run with
+`COOKIE_SAME_SITE=none` and `COOKIE_SECURE=true`, or the session cookie is never sent
+and every authenticated request returns 401. Add the Vercel origin to both buckets'
+CORS as well. See ARCHITECTURE.md §27.8.
 
 Configuration is checked in: `backend/railway.json` (Dockerfile builder, `/health/ready`
 probe, restart-on-failure) and `frontend/vercel.json` (Next.js preset, Bun build).

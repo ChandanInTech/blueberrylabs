@@ -1994,11 +1994,16 @@ mappings are correct without it. Do not reintroduce `baseUrl`, and do not paper
 over the diagnostic with `ignoreDeprecations`. Verified against TypeScript
 5.9.3, 6.0.0-dev and the TS 7 native preview.
 
-**Deployed:** 2026-11-05 — backend live on Railway at
-`https://blueberrylabs-backend-production.up.railway.app` with Railway
-PostgreSQL and two private Railway Buckets. The full flow (demo session →
-presigned browser upload → queue → Sharp → signed download) was exercised
-against the live deployment and real buckets.
+**Deployed:** 2026-11-05 — both halves are live and the full flow was
+exercised in a real browser:
+
+- Frontend: <https://blueberrylabs-frontend.vercel.app> (Vercel)
+- Backend: <https://blueberrylabs-backend-production.up.railway.app> (Railway)
+- PostgreSQL and two private Railway Buckets
+
+Verified in the browser: demo login, direct upload to the Railway bucket,
+generation, preview from a signed URL, download (27,975-byte JPEG) and
+history with a signed thumbnail.
 
 **Last verified:** 2026-11-05 — `lint`, `typecheck`, and 97 tests pass
 (82 backend, 10 frontend) from a cold start with automatic PostgreSQL
@@ -2188,7 +2193,7 @@ These are intentionally unimplemented rather than faked:
 | Item | State |
 | --- | --- |
 | Railway Bucket presigned PUT/GET against live buckets | **Verified live** — presigned PUT 200, presigned GET 200, objects present in both buckets |
-| Vercel ↔ Railway cross-site cookie behaviour | Backend deployed; frontend not yet deployed to Vercel, so the cross-site cookie path is still unverified |
+| Vercel ↔ Railway cross-site cookie behaviour | **Verified live** — requires `COOKIE_SAME_SITE=none` (see 27.8) |
 | Sentry | Seam only (`SENTRY_DSN`); wiring the SDK is a follow-up |
 | OpenTelemetry | Documented partial: correlation ids always emitted, OTLP exporter not attached |
 | Multi-replica metrics | `/metrics` is per process; scraping must be per replica |
@@ -2218,10 +2223,35 @@ deploying rather than by reading docs:
    `railway bucket credentials`.
 
 CORS is not exposed by the CLI. It was applied with `PutBucketCors` (allowed
-origins `http://localhost:3000`, methods `PUT,GET,HEAD`) and verified with an
-`OPTIONS` preflight returning `Access-Control-Allow-Origin`. **Add the Vercel
-production origin to both buckets before deploying the frontend**, or browser
-uploads will be blocked.
+origins `https://blueberrylabs-frontend.vercel.app` and
+`http://localhost:3000`, methods `PUT,GET,HEAD`) and verified with an `OPTIONS`
+preflight returning `Access-Control-Allow-Origin`. Add any new frontend origin
+to both buckets, or browser uploads will be blocked.
+
+### Cross-site cookies (the subtle one)
+
+`*.vercel.app` and `*.up.railway.app` are **different registrable domains**, so
+the browser treats every API call as cross-site. With the default
+`SameSite=Lax`, the session cookie is never sent and every authenticated request
+returns 401 — with no error at login time, which makes it look like a backend
+bug.
+
+Production therefore sets:
+
+```env
+COOKIE_SAME_SITE=none
+COOKIE_SECURE=true
+```
+
+`SameSite=None` is only honoured together with `Secure`, so the auth routes
+refuse to emit that combination otherwise. If the frontend and API are later put
+behind one registrable domain (for example `app.example.com` and
+`api.example.com`), revert to `lax` — it is the safer default.
+
+A second consequence: the API's `bl_csrf` cookie lives on the API's origin and
+is unreadable from the frontend's JavaScript. The frontend therefore takes the
+CSRF token from the auth **response body** and keeps it in memory, falling back
+to the cookie only for same-origin setups.
 
 `railway up` needs `--path-as-root`; without it the archive is prefixed by the
 project directory and Railway falls back to Railpack, which fails with
