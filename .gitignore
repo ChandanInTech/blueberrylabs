@@ -1,2 +1,8 @@
 .agents/
-
+node_modules/
+.env
+.env.local
+.DS_Store
+.e2e/
+.storage/
+*.tsbuildinfo

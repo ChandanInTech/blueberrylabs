@@ -1,0 +1,24 @@
+{
+  "name": "blueberrylabs",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Parent repository: orchestration and documentation only. Application code lives in the backend/ and frontend/ submodules.",
+  "scripts": {
+    "submodules": "git submodule update --init --recursive",
+    "db:up": "docker compose up -d postgres",
+    "db:down": "docker compose down",
+    "dev": "bun run dev:backend & bun run dev:frontend",
+    "dev:backend": "cd backend && bun run dev",
+    "dev:frontend": "cd frontend && bun run dev",
+    "migrate": "cd backend && bun run db:migrate",
+    "setup": "bun run submodules && (cd backend && bun install) && (cd frontend && bun install)",
+    "test": "bun run test:backend && bun run test:frontend",
+    "test:backend": "cd backend && bun run test",
+    "test:frontend": "cd frontend && bun run test",
+    "lint": "cd backend && bun run lint && cd ../frontend && bun run lint",
+    "typecheck": "cd backend && bun run typecheck && cd ../frontend && bun run typecheck",
+    "build": "cd frontend && bun run build",
+    "contracts:sync": "./scripts/sync-contracts.sh",
+    "verify": "bun run lint && bun run typecheck && bun run test"
+  }
+}

@@ -1978,3 +1978,170 @@ Deployment:
 > PostgreSQL job is claimed by the background loop in the Elysia process
 > → Sharp resizes/crops the image → output is uploaded to Railway Bucket
 > → frontend polls status → user previews and downloads the result.
+------------------------------------------------------------------------
+
+## 27. Implementation status (living document)
+
+> **Keep this section current.** Whenever agent implementations, module
+> boundaries, or operational behaviour change, update it here rather than
+> letting this document drift from the code.
+
+**Last verified:** 2026-11-05 — `lint`, `typecheck`, and 91 tests pass
+(81 backend, 10 frontend); the full browser flow was exercised against a
+running stack.
+
+### 27.1 Milestone status
+
+| Sprint | Scope | Status |
+| --- | --- | --- |
+| 0 | Repositories, runtime foundation, env validation, logging | Done |
+| 1 | Database, demo auth, rate limiting, quotas | Done |
+| 2 | Direct upload, presigned URLs, verification | Done |
+| 3 | PostgreSQL queue, Sharp worker, retries, recovery | Done |
+| 4 | Frontend upload/preset/polling/history UX | Done |
+| 5 | Observability, hardening, deployment assets | Done (see 27.6 for external gaps) |
+
+### 27.2 Deviations from the original plan, and why
+
+1. **`backend/contracts` replaces a published npm package.** The contracts are
+   still one authoritative module and are still distributed as a versioned
+   tarball, but packing happens locally (`scripts/sync-contracts.sh` →
+   `frontend/vendor/`) instead of via a registry. This keeps the submodule
+   boundary intact without requiring publish credentials.
+2. **A `filesystem` storage driver exists alongside the S3 adapter.** Required by
+   section 25.13 (no external credentials available). It mirrors the presigned
+   URL contract exactly (`/__storage/:bucket/*?expires&signature`) and is
+   **never** the production driver; `STORAGE_DRIVER=s3` is the default in
+   `.env.example`.
+3. **Each demo login creates a distinct principal.** Section 5.2 permits a shared
+   demo principal, but per-login principals make ownership isolation real and
+   testable (see `test/integration/auth.test.ts`).
+4. **`@elysiajs/openapi` serves docs at `/api/docs`.** Named `openapi` in v1.x of
+   the plugin; the route is unchanged from the plan's intent.
+5. **The request context is stored per-`Request` (WeakMap + AsyncLocalStorage).**
+   Elysia v1 has no `declare()` singleton hook, so `derive()` would have coupled
+   every module to the composition root. Hooks read `getContext(request)`.
+6. **The `Origin` check runs globally in `onBeforeHandle`.** It is not left to
+   individual routes; a per-route check was measurably skippable on
+   unauthenticated paths such as logout.
+7. **CSRF requires the header strictly.** The `bl_csrf` cookie is *not* accepted
+   as a fallback for the header; accepting it would let anyone able to write
+   cookies bypass the double-submit check.
+8. **`Worker.runOnce()` exists for deterministic testing and operational drain.**
+   The production path is still the polling loop.
+
+### 27.3 Backend module layout as built
+
+```
+backend/
+├── contracts/                     # @social-resizer/contracts (authoritative)
+│   └── src/{presets,errors,status,api,index}.ts
+├── src/
+│   ├── app.ts                     # composition root: CORS, docs, context, errors, metrics
+│   ├── server.ts                  # boot probe, listen, worker, cleanup, graceful shutdown
+│   ├── config/env.ts              # zod-validated environment (fail fast)
+│   ├── db/{client,schema,migrate}  # drizzle + checked-in migrations
+│   ├── middleware/                # auth, origin, rate-limit, request-context, error-handler
+│   ├── modules/                   # auth, uploads(+assets), generations, health
+│   ├── queue/                     # worker, claim-job, retry, handlers/process-image
+│   ├── services/                  # storage/{interface,railway-bucket,filesystem},
+│   │                              # image/sharp-processor, generation/{service,quota}
+│   └── observability/             # logger, metrics, cleanup, error-tracking, tracing
+├── test/{unit,integration}/       # bun:test; integration boots its own PostgreSQL
+├── Dockerfile, docker-entrypoint.sh, drizzle.config.ts
+```
+
+Notable additions beyond the planned tree: `services/generation/quota-service.ts`
+(daily + concurrency quotas and ownership checks live in one place),
+`services/storage/local-routes.ts`, `observability/cleanup.ts`, and
+`middleware/origin.ts`.
+
+### 27.4 Behavioural contracts worth knowing before changing code
+
+**Job claiming** — a single statement, executed with `FOR UPDATE SKIP LOCKED`:
+
+```sql
+WITH candidate AS (
+  SELECT id FROM jobs
+  WHERE status = 'QUEUED' AND run_at <= now() AND type = $2
+  ORDER BY priority DESC, created_at ASC
+  FOR UPDATE SKIP LOCKED
+  LIMIT 1
+)
+UPDATE jobs SET status='RUNNING', locked_at=now(), locked_by=$1,
+                attempts=jobs.attempts+1, updated_at=now()
+WHERE jobs.id IN (SELECT id FROM candidate)
+RETURNING id, type, payload, attempts, max_attempts;
+```
+
+**Retry schedule** (`computeRetry`): `base * 3^(attempt-1) ± jitter`, so
+~5 s then ~15 s, terminal on attempt 3. `JobError.retryable=false` skips retries
+entirely — used for corrupt images, unsupported presets, and missing sources.
+
+**Leases** are refreshed every `leaseSeconds / 3`. `recoverStaleJobs(leaseSeconds)`
+requeues or fails expired `RUNNING` jobs and reconciles the generation out of
+`PROCESSING`, so no generation can be stuck in a non-terminal state after a crash.
+
+**Idempotency** is layered: a unique `(user_id, idempotency_key)` partial index,
+a payload comparison that returns `409 IDEMPOTENCY_CONFLICT` on mismatch, an
+early return for terminal generations in the handler, and a deterministic output
+object key per generation so a redelivered job overwrites instead of duplicating.
+
+**Rate limiting** is one atomic `INSERT … ON CONFLICT DO UPDATE` inside the
+`consume_rate_limit(key, limit, window)` SQL function. Keys are SHA-256 of
+`secret:operation:dimension:value`, so raw IPs and user ids never reach the
+database. Rules are configured in `middleware/rate-limit.ts::rules()`.
+
+**Quotas** are checked inside the same transaction that inserts the generation,
+under `pg_advisory_xact_lock(hashtext('generation-quota:<userId>'))`, so
+simultaneous requests cannot both slip under the limit.
+
+**Image output** — `fit: cover` + centre, `rotate()` before crop, JPEG for opaque
+sources, PNG when alpha is present (`IMAGE_PRESERVE_TRANSPARENCY`), flattening
+only onto a configured background colour, metadata stripped, `limitInputPixels`
+mapped to the specific `IMAGE_TOO_LARGE` error.
+
+### 27.5 Frontend module layout as built
+
+```
+frontend/
+├── app/{layout,globals.css}
+├── app/login/page.tsx
+├── app/(app)/{layout,page}.tsx
+├── app/(app)/generations/[id]/page.tsx
+├── app/(app)/history/page.tsx
+├── components/{session,upload,presets,generation,ui}/
+├── hooks/{use-upload,use-generation-polling}.ts
+├── lib/{api-client,auth,upload,validation}.ts
+└── vendor/social-resizer-contracts-1.0.0.tgz
+```
+
+`useUpload` models the phases from section 11.3 as distinct states
+(`SELECT_IMAGE → REQUESTING_UPLOAD → UPLOADING → VERIFYING_UPLOAD →
+READY_TO_GENERATE`, plus `FAILED`), so browser upload progress is never
+conflated with server processing progress.
+
+`useGenerationPolling` enforces every rule in section 11.2: poll only while
+non-terminal, single in-flight request, abort on unmount, 5 s cadence after 30 s,
+10 s when the tab is hidden with an immediate refresh on return, exponential
+backoff honouring `Retry-After`, and fatal stop on 401/404.
+
+### 27.6 External gaps (require credentials/infrastructure)
+
+These are intentionally unimplemented rather than faked:
+
+| Item | State |
+| --- | --- |
+| Railway Bucket presigned PUT/GET against live buckets | Adapter implemented; only the filesystem driver was exercised end to end |
+| Vercel ↔ Railway cross-site cookie behaviour | Requires a real deployment; `SameSite=Lax` + `COOKIE_SECURE=auto` configured |
+| Sentry | Seam only (`SENTRY_DSN`); wiring the SDK is a follow-up |
+| OpenTelemetry | Documented partial: correlation ids always emitted, OTLP exporter not attached |
+| Multi-replica metrics | `/metrics` is per process; scraping must be per replica |
+
+### 27.7 Verification commands
+
+```bash
+npm run verify          # lint + typecheck + test, both submodules
+bun --cwd backend test  # boots a throwaway PostgreSQL if none is configured
+npm run contracts:sync  # after changing backend/contracts
+```
