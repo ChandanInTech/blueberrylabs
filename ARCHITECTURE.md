@@ -1994,7 +1994,13 @@ mappings are correct without it. Do not reintroduce `baseUrl`, and do not paper
 over the diagnostic with `ignoreDeprecations`. Verified against TypeScript
 5.9.3, 6.0.0-dev and the TS 7 native preview.
 
-**Last verified:** 2026-11-05 — `lint`, `typecheck`, and 92 tests pass
+**Deployed:** 2026-11-05 — backend live on Railway at
+`https://blueberrylabs-backend-production.up.railway.app` with Railway
+PostgreSQL and two private Railway Buckets. The full flow (demo session →
+presigned browser upload → queue → Sharp → signed download) was exercised
+against the live deployment and real buckets.
+
+**Last verified:** 2026-11-05 — `lint`, `typecheck`, and 97 tests pass
 (82 backend, 10 frontend) from a cold start with automatic PostgreSQL
 provisioning; the full browser flow was exercised against a running stack.
 All three CI pipelines are green (7 jobs). The production Docker image was
@@ -2181,13 +2187,47 @@ These are intentionally unimplemented rather than faked:
 
 | Item | State |
 | --- | --- |
-| Railway Bucket presigned PUT/GET against live buckets | Adapter implemented; only the filesystem driver was exercised end to end |
-| Vercel ↔ Railway cross-site cookie behaviour | Requires a real deployment; `SameSite=Lax` + `COOKIE_SECURE=auto` configured |
+| Railway Bucket presigned PUT/GET against live buckets | **Verified live** — presigned PUT 200, presigned GET 200, objects present in both buckets |
+| Vercel ↔ Railway cross-site cookie behaviour | Backend deployed; frontend not yet deployed to Vercel, so the cross-site cookie path is still unverified |
 | Sentry | Seam only (`SENTRY_DSN`); wiring the SDK is a follow-up |
 | OpenTelemetry | Documented partial: correlation ids always emitted, OTLP exporter not attached |
 | Multi-replica metrics | `/metrics` is per process; scraping must be per replica |
 
-### 27.8 Verification commands
+### 27.8 Railway deployment notes
+
+Live resources (project `blueberrylabs`, environment `production`):
+
+| Resource | Detail |
+| --- | --- |
+| `blueberrylabs-backend` | Dockerfile build, `/health/ready` probe, public domain |
+| `Postgres` | `postgres-ssl:18`, referenced via `${{Postgres.DATABASE_URL}}` |
+| `media-originals` | bucket `media-originals-rhkdzcsji`, region `iad` |
+| `media-generated` | bucket `media-generated-iklbv0b92`, region `iad` |
+
+Three things about Railway Buckets that the code must respect, each found by
+deploying rather than by reading docs:
+
+1. **Credentials are per bucket.** A key pair for `media-originals` returns
+   `403 AccessDenied` against `media-generated`. The adapter builds one S3
+   client per bucket.
+2. **Addressing is virtual-host.** `railway bucket credentials` reports
+   `urlStyle: virtual-host`; path-style signing yields URLs the bucket rejects.
+   `RAILWAY_BUCKET_FORCE_PATH_STYLE` defaults to `false`.
+3. **Bucket names are suffixed.** The dashboard name `media-originals` is not
+   the S3 bucket name; use the `bucketName` field from
+   `railway bucket credentials`.
+
+CORS is not exposed by the CLI. It was applied with `PutBucketCors` (allowed
+origins `http://localhost:3000`, methods `PUT,GET,HEAD`) and verified with an
+`OPTIONS` preflight returning `Access-Control-Allow-Origin`. **Add the Vercel
+production origin to both buckets before deploying the frontend**, or browser
+uploads will be blocked.
+
+`railway up` needs `--path-as-root`; without it the archive is prefixed by the
+project directory and Railway falls back to Railpack, which fails with
+"No start command detected". `railway.toml` is committed for this reason.
+
+### 27.9 Verification commands
 
 ```bash
 bun run verify          # lint + typecheck + test, both submodules

@@ -6,6 +6,7 @@ Upload from the browser, choose a preset, and the server produces a pixel-perfec
 [![CI](https://github.com/ChandanInTech/blueberrylabs/actions/workflows/ci.yml/badge.svg)](https://github.com/ChandanInTech/blueberrylabs/actions/workflows/ci.yml)
 
 - **Status:** MVP, demo authentication only
+- **Live API:** <https://blueberrylabs-backend-production.up.railway.app> (Railway, PostgreSQL + private buckets)
 - **Full design:** [ARCHITECTURE.md](./ARCHITECTURE.md)
 - **Agent guidance:** [AGENTS.md](./AGENTS.md)
 
@@ -165,6 +166,12 @@ probe, restart-on-failure) and `frontend/vercel.json` (Next.js preset, Bun build
 `NEXT_PUBLIC_API_BASE_URL` is read from a Vercel environment variable, never committed.
 
 **Railway Buckets.** Create private `media-originals` and `media-generated` buckets.
+Note that Railway issues **per-bucket** credentials and uses **virtual-host**
+addressing, and that the S3 bucket name is suffixed (e.g.
+`media-originals-rhkdzcsji`) — use the `bucketName` from
+`railway bucket credentials`, not the dashboard name. CORS is not exposed by the
+CLI; apply it with `PutBucketCors` and add your Vercel origin before deploying
+the frontend. See ARCHITECTURE.md §27.8.
 Enable CORS for the Vercel origin with `PUT`, `GET`, and the `Content-Type` header —
 without wildcard origins in production.
 
