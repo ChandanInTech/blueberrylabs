@@ -1997,6 +1997,9 @@ over the diagnostic with `ignoreDeprecations`. Verified against TypeScript
 **Last verified:** 2026-11-05 — `lint`, `typecheck`, and 92 tests pass
 (82 backend, 10 frontend) from a cold start with automatic PostgreSQL
 provisioning; the full browser flow was exercised against a running stack.
+All three CI pipelines are green (7 jobs). The production Docker image was
+built with `--no-cache` and run against `postgres:16`, completing the full
+upload → generate → download flow.
 
 ### 27.1 Milestone status
 
@@ -2007,7 +2010,7 @@ provisioning; the full browser flow was exercised against a running stack.
 | 2 | Direct upload, presigned URLs, verification | Done |
 | 3 | PostgreSQL queue, Sharp worker, retries, recovery | Done |
 | 4 | Frontend upload/preset/polling/history UX | Done |
-| 5 | Observability, hardening, deployment assets | Done (see 27.6 for external gaps) |
+| 5 | Observability, hardening, deployment assets, CI | Done (see 27.7 for external gaps) |
 
 ### 27.2 Deviations from the original plan, and why
 
@@ -2143,7 +2146,36 @@ non-terminal, single in-flight request, abort on unmount, 5 s cadence after 30 s
 10 s when the tab is hidden with an immediate refresh on return, exponential
 backoff honouring `Retry-After`, and fatal stop on 401/404.
 
-### 27.6 External gaps (require credentials/infrastructure)
+### 27.6 CI and deployment configuration
+
+| Artifact | Repository | Purpose |
+| --- | --- | --- |
+| `.github/workflows/ci.yml` | parent | Submodule integrity, no application source in parent, no application dependencies in parent `package.json`, pinned-commit builds of both sides, contracts tarball content drift |
+| `.github/workflows/ci.yml` | backend | Lint, typecheck, test against a `postgres:16` service; Docker image build |
+| `.github/workflows/ci.yml` | frontend | Lint, typecheck, test, production `next build` |
+| `railway.json` | backend | Dockerfile builder, `/health/ready` probe, restart-on-failure |
+| `vercel.json` | frontend | Next.js preset, Bun install/build, `NEXT_PUBLIC_API_BASE_URL` from env |
+| `.tool-versions` | both | Pins Bun 1.3.13 for local tooling and CI |
+
+The contracts drift check compares per-entry sha256 of file **content**. A naive
+comparison of `tar -t` output reported a match after a real source change and
+was replaced. `scripts/sync-contracts.sh` deletes `frontend/bun.lock` before
+reinstalling and then performs a `--frozen-lockfile` install, because
+`bun install` alone silently reuses a stale integrity hash when `node_modules`
+already exists.
+
+Three defects were found by running CI rather than assuming it worked, and are
+recorded here so they are not reintroduced:
+
+1. A duplicated `token:` key made the parent workflow invalid, so it never
+   started.
+2. The Dockerfile installed dependencies with `--production`, which omits the
+   `typescript` binary the contracts build needs; this was hidden locally by a
+   cached layer.
+3. The committed `frontend/bun.lock` carried a stale integrity hash for the
+   vendored tarball, which only fails on a clean checkout.
+
+### 27.7 External gaps (require credentials/infrastructure)
 
 These are intentionally unimplemented rather than faked:
 
@@ -2155,10 +2187,13 @@ These are intentionally unimplemented rather than faked:
 | OpenTelemetry | Documented partial: correlation ids always emitted, OTLP exporter not attached |
 | Multi-replica metrics | `/metrics` is per process; scraping must be per replica |
 
-### 27.7 Verification commands
+### 27.8 Verification commands
 
 ```bash
-npm run verify          # lint + typecheck + test, both submodules
-bun --cwd backend test  # boots a throwaway PostgreSQL if none is configured
-npm run contracts:sync  # after changing backend/contracts
+bun run verify          # lint + typecheck + test, both submodules
+bun run contracts:sync  # after changing backend/contracts (self-verifies)
+cd backend && bun test  # boots a throwaway PostgreSQL if none is configured
+
+# Reproduce what CI does for the container:
+cd backend && docker build --no-cache -t blueberrylabs-backend:ci .
 ```

@@ -3,6 +3,8 @@
 Crop and resize any image to the exact dimensions Instagram, TikTok and YouTube expect.
 Upload from the browser, choose a preset, and the server produces a pixel-perfect result.
 
+[![CI](https://github.com/ChandanInTech/blueberrylabs/actions/workflows/ci.yml/badge.svg)](https://github.com/ChandanInTech/blueberrylabs/actions/workflows/ci.yml)
+
 - **Status:** MVP, demo authentication only
 - **Full design:** [ARCHITECTURE.md](./ARCHITECTURE.md)
 - **Agent guidance:** [AGENTS.md](./AGENTS.md)
@@ -158,6 +160,10 @@ if you apply them as a separate release step.
 `NEXT_PUBLIC_API_BASE_URL` to the public Railway URL. Never put bucket credentials in
 `NEXT_PUBLIC_*`.
 
+Configuration is checked in: `backend/railway.json` (Dockerfile builder, `/health/ready`
+probe, restart-on-failure) and `frontend/vercel.json` (Next.js preset, Bun build).
+`NEXT_PUBLIC_API_BASE_URL` is read from a Vercel environment variable, never committed.
+
 **Railway Buckets.** Create private `media-originals` and `media-generated` buckets.
 Enable CORS for the Vercel origin with `PUT`, `GET`, and the `Content-Type` header —
 without wildcard origins in production.
@@ -185,6 +191,26 @@ the required `Content-Type`. The API only marks an asset `UPLOADED` after a succ
 
 **Database migration.** Back up, run `npm run migrate` once, verify `/health/ready`, and
 roll forward with a corrective migration where possible.
+
+## Continuous integration
+
+Each repository owns its workflow, per the architecture:
+
+| Repository | Jobs |
+| --- | --- |
+| parent | submodule integrity, no app source or dependencies in the parent, pinned-commit builds of both sides, contracts tarball drift |
+| backend | lint, typecheck, test (real `postgres:16` service), Docker image build |
+| frontend | lint, typecheck, test, production `next build` |
+
+Submodules are public, so CI clones them with the default token. If you make them
+private again, set a `SUBMODULE_TOKEN` secret on the parent repository with read
+access to both.
+
+Reproduce the container build locally:
+
+```bash
+cd backend && docker build --no-cache -t blueberrylabs-backend:ci .
+```
 
 ## Known limitations
 
