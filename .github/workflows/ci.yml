@@ -1,0 +1,186 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  submodules:
+    name: Submodules initialized and pinned to pushed commits
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Verify both submodules are checked out
+        run: |
+          git submodule status
+          if git submodule status | grep -q '^-'; then
+            echo "::error::A submodule is not initialized."
+            exit 1
+          fi
+
+      # The parent must never reference an unpushed submodule commit: the pin
+      # would be uncloneable for everyone else.
+      - name: Verify pinned commits exist on their remotes
+        run: |
+          set -euo pipefail
+          status=0
+          while read -r _sha _path _ref; do
+            dir=$(echo "$_path" | sed 's/^[ +-]*//')
+            sha=$(git -C "$dir" rev-parse HEAD)
+            echo "Checking $dir @ $sha"
+            if ! git -C "$dir" branch -r --contains "$sha" 2>/dev/null | grep -q .; then
+              echo "::error::$dir is pinned to $sha, which is not on any remote branch."
+              status=1
+            fi
+          done < <(git submodule status)
+          exit $status
+
+      - name: Parent repository contains no application source
+        run: |
+          # Application code belongs in the submodules. Fail if someone copies
+          # it into the orchestrating repository.
+          if git ls-files | grep -E '^(src|app|components|hooks|lib|test)/'; then
+            echo "::error::Application source found in the parent repository."
+            exit 1
+          fi
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.13
+
+      - name: Verify delegating scripts resolve
+        run: |
+          set -euo pipefail
+          bun --version
+          # Scripts must delegate into the submodules, not carry dependencies.
+          node -e '
+            const pkg = require("./package.json");
+            if (pkg.dependencies || pkg.devDependencies) {
+              console.error("Parent package.json must not declare application dependencies");
+              process.exit(1);
+            }
+          '
+
+  backend:
+    name: Backend builds (pinned commit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: app
+          POSTGRES_PASSWORD: app
+          POSTGRES_DB: social_resizer_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U app -d social_resizer_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_ADMIN_DATABASE_URL: postgresql://app:app@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: backend/.tool-versions
+
+      - run: bun install --frozen-lockfile
+        working-directory: backend
+
+      - run: bun run lint
+        working-directory: backend
+
+      - run: bun run typecheck
+        working-directory: backend
+
+      - run: bun run test
+        working-directory: backend
+
+  frontend:
+    name: Frontend builds (pinned commit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: frontend/.tool-versions
+
+      - run: bun install --frozen-lockfile
+        working-directory: frontend
+
+      - run: bun run lint
+        working-directory: frontend
+
+      - run: bun run typecheck
+        working-directory: frontend
+
+      - run: bun run test
+        working-directory: frontend
+
+      - run: bun run build
+        working-directory: frontend
+        env:
+          NEXT_PUBLIC_API_BASE_URL: http://localhost:3001
+
+  contracts:
+    name: Contracts tarball matches source
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: backend/.tool-versions
+
+      # A stale vendored tarball means the frontend is building against an old
+      # contract while the backend moved on. Catch it here.
+      - name: Rebuild and compare
+        run: |
+          set -euo pipefail
+          (cd backend/contracts && bun install --frozen-lockfile && bun run build)
+          mkdir -p /tmp/contracts-check
+          (cd backend/contracts && bun pm pack --destination /tmp/contracts-check >/dev/null)
+          vendored=$(ls frontend/vendor/social-resizer-contracts-*.tgz)
+          generated=$(ls /tmp/contracts-check/social-resizer-contracts-*.tgz)
+
+          # Compare file CONTENT, not just names. Comparing `tar -t` output
+          # misses a changed .ts/.d.ts body entirely.
+          manifest() {
+            tar -tzf "$1" | sort | while read -r entry; do
+              case "$entry" in
+                */) continue ;;
+              esac
+              printf '%s  %s\n' "$(tar -xzOf "$1" "$entry" | sha256sum | cut -d' ' -f1)" "$entry"
+            done
+          }
+
+          if ! diff <(manifest "$vendored") <(manifest "$generated") > /tmp/contracts-diff.txt; then
+            echo "::error::frontend/vendor contracts tarball differs from backend/contracts. Run scripts/sync-contracts.sh."
+            head -20 /tmp/contracts-diff.txt
+            exit 1
+          fi
+          echo "Contracts tarball contents match."
