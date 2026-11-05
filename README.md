@@ -232,9 +232,10 @@ cd backend && docker build --no-cache -t blueberrylabs-backend:ci .
   against live infrastructure in this environment; the S3 adapter follows the
   documented S3 signer behaviour, and the filesystem adapter mirrors the same URL
   contract for local verification.
-- OpenTelemetry is a documented partial integration (correlation IDs are mandatory and
-  always present; the OTLP exporter is wired only when an endpoint is configured).
-- Sentry support is a seam (`SENTRY_DSN`) that must be backed by the SDK before use.
+- OpenTelemetry is Elysia's first-party `@elysia/opentelemetry` plugin (lifecycle
+  spans per request, `record` worker spans), exported over OTLP/HTTP when
+  `OTEL_EXPORTER_OTLP_ENDPOINT` is set; correlation IDs and structured logs are
+  always present without it.
 - Metrics are per-process in-memory counters exposed at `/metrics`; a multi-replica
   deployment needs a scraper per replica (e.g. Prometheus with per-pod targets).
 

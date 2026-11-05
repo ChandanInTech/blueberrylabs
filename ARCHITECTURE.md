@@ -103,8 +103,8 @@ added without redesigning the API.
 
   Logging                             Structured JSON logs
 
-  Error tracking                      Sentry or an equivalent provider;
-                                      make optional by environment
+  Error handling                      Captured in structured JSON logs
+                                      with correlation IDs
 
   Tracing / metrics                   OpenTelemetry-compatible
                                       instrumentation where supported;
@@ -1617,16 +1617,30 @@ concurrency and active job count.
 Avoid high-cardinality metric labels such as user IDs, generation IDs,
 or request IDs. Those belong in logs/traces, not metric dimensions.
 
-### 15.4 Error tracking and tracing
+### 15.4 Error handling and tracing
 
--   Integrate Sentry or an equivalent error tracker behind optional
-    environment configuration.
--   Capture unhandled API and worker errors.
--   Use OpenTelemetry where the Bun runtime and selected exporters
-    support it; do not claim full distributed tracing if only partial
-    instrumentation is available.
--   If tracing integration is delayed, request IDs and structured
-    lifecycle logs are still mandatory for MVP acceptance.
+-   Capture unhandled API and worker errors in structured JSON logs.
+-   Tracing uses Elysia's first-party `@elysia/opentelemetry` plugin,
+    applied first in the composition root (`tracingPlugin()` in
+    `observability/tracing.ts`). It creates grouped lifecycle spans per
+    HTTP request, continuing any inbound W3C `traceparent` (the active
+    trace id is echoed as `X-Trace-Id` and attached to log lines).
+    Worker job spans use the plugin's `record` utility. Library
+    auto-instrumentation is disabled (`instrumentations: []`) because
+    Bun's Node compatibility layer only partially supports the
+    monkey-patching it relies on — full distributed tracing is not
+    claimed.
+-   Traces are exported over OTLP/HTTP (`OTLPTraceExporter`) when
+    `OTEL_EXPORTER_OTLP_ENDPOINT` is set to a collector base URL, under
+    `OTEL_SERVICE_NAME` (default `blueberrylabs-backend`). Without an
+    endpoint the plugin is not applied. The SDK is flushed via the
+    tracer-provider delegate on graceful shutdown; an unreachable
+    collector never crashes the process.
+-   Request IDs, the `traceId` on every log line (when active), and the
+    structured JSON logs remain the mandatory observability baseline,
+    independent of whether an OTLP endpoint is configured. Metrics stay
+    on the custom Prometheus `/metrics` endpoint; OpenTelemetry is used
+    for traces only.
 
 ### 15.5 Health checks
 
@@ -1697,8 +1711,8 @@ MAX_CONCURRENT_GENERATIONS_PER_USER=2
 MAX_GENERATIONS_PER_USER_PER_DAY=20
 MAX_PENDING_UPLOADS_PER_USER=5
 
-SENTRY_DSN=
 OTEL_EXPORTER_OTLP_ENDPOINT=
+OTEL_SERVICE_NAME=blueberrylabs-backend
 ```
 
 The exact Railway Bucket environment-variable names should be taken from
@@ -1985,8 +1999,8 @@ access another user's generation.
 
 Tasks: - Complete structured API and worker lifecycle logs. - Add
 request/generation/job correlation. - Add metrics for API, queue, rate
-limits, uploads, and processing. - Configure optional Sentry and
-OpenTelemetry exporter. - Add production CORS/cookie configuration. -
+limits, uploads, and processing. - Configure optional OpenTelemetry
+exporter. - Add production CORS/cookie configuration. -
 Deploy API and PostgreSQL to Railway. - Create and configure Railway
 Buckets. - Deploy frontend to Vercel. - Run migrations and end-to-end
 smoke test. - Document operational runbook and known limitations.
@@ -2218,7 +2232,7 @@ Observability:
   Structured JSON logs
   Request/generation/job correlation
   Metrics
-  Optional Sentry + OpenTelemetry
+  Optional OpenTelemetry
 
 Deployment:
   Vercel frontend (from frontend/ submodule repo)
@@ -2326,7 +2340,7 @@ backend/
 │   ├── queue/                     # worker, claim-job, retry, handlers/process-image
 │   ├── services/                  # storage/{interface,railway-bucket,filesystem},
 │   │                              # image/sharp-processor, generation/{service,quota}
-│   └── observability/             # logger, metrics, cleanup, error-tracking, tracing
+│   └── observability/             # logger, metrics, cleanup, tracing
 ├── test/{unit,integration}/       # bun:test; integration boots its own PostgreSQL
 ├── Dockerfile, docker-entrypoint.sh, drizzle.config.ts
 ```
@@ -2452,8 +2466,7 @@ These are intentionally unimplemented rather than faked:
 | --- | --- |
 | Railway Bucket presigned PUT/GET against live buckets | **Verified live** — presigned PUT 200, presigned GET 200, objects present in both buckets |
 | Vercel ↔ Railway cross-site auth | **Resolved** — replaced cookies with bearer JWTs, so cross-site cookie policy no longer applies (see 5.2 and 27.8) |
-| Sentry | Seam only (`SENTRY_DSN`); wiring the SDK is a follow-up |
-| OpenTelemetry | Documented partial: correlation ids always emitted, OTLP exporter not attached |
+| OpenTelemetry | Elysia first-party `@elysia/opentelemetry` plugin (lifecycle spans + `record` worker spans), exported via OTLP/HTTP when `OTEL_EXPORTER_OTLP_ENDPOINT` is configured in the deployment; library auto-instrumentation disabled on Bun; correlation ids always emitted regardless |
 | Multi-replica metrics | `/metrics` is per process; scraping must be per replica |
 
 ### 27.8 Railway deployment notes
