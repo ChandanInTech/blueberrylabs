@@ -103,8 +103,8 @@ selection; the frontend only renders the list.
 Base path `/api/v1`. Interactive docs at `/api/docs`.
 
 ```
-POST /auth/demo                      create demo session
-GET  /auth/session                   current session
+POST /auth/login                     exchange access code for a JWT
+GET  /auth/session                   current principal
 POST /auth/logout                    revoke session
 
 POST /uploads                        create asset + presigned PUT URL
@@ -130,11 +130,12 @@ Errors always use one shape:
 
 ## Security model (MVP)
 
-- Demo-only server-issued sessions. HttpOnly, `SameSite=Lax`, `Secure` in production.
-- The server derives `userId` from the session row — never from the client.
+- Demo-only access codes exchanged for a 24h bearer JWT (`Authorization` header);
+  the server derives `userId` from the verified token — never from the client.
 - Every asset and generation read is ownership-scoped; another user's id returns 404.
-- CSRF protection: `Origin` allow-list on all unsafe methods plus a double-submit CSRF
-  token that must arrive in the `X-CSRF-Token` header.
+- No CSRF token: a browser never attaches an `Authorization` header on its own,
+  so the CSRF attack does not apply. The `Origin` allow-list is kept on all
+  unsafe methods as defence in depth.
 - Bucket credentials are server-side only; the browser only ever sees short-lived
   signed URLs.
 - Rate limits (per user *and* per IP) and daily/concurrency quotas are enforced with
@@ -144,8 +145,9 @@ Errors always use one shape:
 
 ### Demo limitations — read before deploying publicly
 
-- There is no signup, password, or OAuth. Each demo login creates a fresh principal.
-- Anyone with the URL can mint a session. This is **not** multi-tenant identity.
+- There is no signup, password, or OAuth. Access codes are issued by an operator
+  out of band; each code is a permanent login for its user. This is **not**
+  multi-tenant identity.
 - Before real use, replace demo auth with an identity provider and keep the same
   `userId` ownership model.
 

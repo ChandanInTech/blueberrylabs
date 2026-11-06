@@ -645,8 +645,8 @@ The cookie + CSRF implementation was deleted, not left dormant:
     `DEMO_SESSION_TTL_HOURS` environment variables.
 -   `POST /api/v1/auth/demo`.
 -   The `X-CSRF-Token` CORS allowed header (replaced by `Authorization`).
--   `CSRF_TOKEN_INVALID` is still a valid error code in the contracts package
-    for compatibility, but nothing emits it.
+-   `CSRF_TOKEN_INVALID` error code and its `errors.csrf()` factory (removed
+    from the contracts package in 1.1.0; nothing ever emitted it).
 
 ------------------------------------------------------------------------
 
